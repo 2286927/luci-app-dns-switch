@@ -1,9 +1,16 @@
 name: build
 
+# 只在三种情况跑，不做「每次 push 都构建」：
+# 私有仓库的 Actions 分钟数是要花钱的，而 SDK 构建一次双架构要 40 分钟以上。
+# 推 11 个文件就是 9 次 run × 2 个 SDK，足够把一个月的额度烧掉。
 on:
+  workflow_dispatch:          # 手动触发（默认用法）
   push:
+    tags: [ 'v*' ]            # 打版本标签时自动出包
   pull_request:
-  workflow_dispatch:
+    paths:                    # 动到包本体才验证
+      - 'luci-app-dns-switch/**'
+      - 'check.sh'
 
 jobs:
   package:
