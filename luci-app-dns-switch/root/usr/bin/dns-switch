@@ -1,0 +1,1809 @@
+#!/bin/sh
+# ============================================================
+# dns-switch —— R68S DNS 一键切换（V1 / 两态）
+#
+#   目标模式 mode（意图）:  off | on
+#   实际生效 effective（事实）: off | on | failover
+#
+#   on        全屋 DNS 走玩客云 AdGuardHome（172.16.1.2）
+#   failover  ADH 连续探测失败 → 自动退回运营商，mode 保持不变
+#   off       路由器原生 DNS（运营商兜底），无劫持
+#
+# 设计要点：
+#   1. 闸门优先：探测不到 ADH 就拒绝切换，配置一个字节不改（ADH 二进制是手工放的）
+#   2. 改完必自检，自检不过自动回滚
+#   3. 853（DoT/DoQ）策略可配：allow 放行 / block 拦截（默认 allow）
+#   4. IPv6 豁免用 ether saddr <MAC>，不用会随 PPPoE 变化的 GUA、也不用会随重刷变化的 ULA
+#   5. 不碰 /etc/crontabs，用 procd 守护 + tick
+#
+# 用法：
+#   dns-switch on                启用 ADH DNS（含闸门探测）
+#   dns-switch off               恢复原生 DNS
+#   dns-switch rescue            逃生：强制复位 DNS（不依赖 daemon，不重启、不碰接口）
+#   dns-switch drill             演练：真跑一遍降级与回切，验证链路能自动兜住
+#   dns-switch bundle            生成诊断包（tar.gz 路径会打印出来）
+#   dns-switch timeline [n]      最近 n 条事件（切换/降级/漂移/冲突）
+#   dns-switch snapshot          列出快照
+#   dns-switch snapshot save     立即存一份快照
+#   dns-switch snapshot restore  回滚到指定快照
+#   dns-switch snapshot diff     比较两份快照（不给参数则比最近两份）
+#   dns-switch status            查看状态
+#   dns-switch restore-original  恢复原生 + 清空调试备份
+#   dns-switch init | tick | apply-intent | daemon   内部用
+# ============================================================
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin
+
+# ---------- 常量 ----------
+CFG=dns_switch
+NFT_FRAG=/etc/nftables.d/20-dns-hijack.nft
+BK=/etc/dns-switch
+LOCK=/var/lock/dns-switch.lock
+RESOLV_AUTO=/tmp/resolv.conf.d/resolv.conf.auto
+ST_FAIL=/tmp/dns-switch.fail
+ST_SUCC=/tmp/dns-switch.succ
+ST_COOL=/tmp/dns-switch.cooldown
+ST_CHECK=/tmp/dns-switch.last_check
+COOLDOWN=120          # 两次迁移之间的冷却秒数
+FAIL_NEED=2           # 连续失败几次才降级
+SUCC_NEED=3           # 连续成功几次才回切
+
+# 演练用：这个文件存在时 probe_adh 一律判失败，用来验证降级链
+# 只用文件不用环境变量——环境变量跨不过子 shell，而且演练中途被 kill
+# 时痕迹留在文件上更好查。超过 PROBE_FAIL_TTL 秒自动失效，防止演练
+# 被强杀后系统永久判 ADH 失联。
+PROBE_FAIL_FLAG=/tmp/dns-switch.probe-fail
+PROBE_FAIL_TTL=300
+EVENTS=/etc/dns-switch/events.log
+TL_KEEP_DAYS=7        # 时间线保留天数
+
+# ---------- 读数 ----------
+s_opt() { uci -q get "$CFG.settings.$1" 2>/dev/null; }
+t_opt() { uci -q get "$CFG.status.$1" 2>/dev/null; }
+
+ADH=$(s_opt adh_ip);           ADH=${ADH:-172.16.1.2}
+ADH_PORT=$(s_opt adh_port);    ADH_PORT=${ADH_PORT:-3030}
+FB=$(s_opt fallback_dns);      FB=${FB:-172.16.5.5}
+FB6=$(s_opt fallback_dns6)                     # IPv6 备用，走 RDNSS，空=不下发
+PROBE_DOMAIN=$(s_opt probe_domain); PROBE_DOMAIN=${PROBE_DOMAIN:-www.baidu.com}
+
+# 可配置项（每家的网络结构不一样，别写死）
+MAC_CFG=$(s_opt adh_mac)                       # 手填 MAC，空=自动探测
+DOT853=$(s_opt dot853);        DOT853=${DOT853:-allow}   # allow | block
+UPSTREAM_MODE=$(s_opt upstream_mode); UPSTREAM_MODE=${UPSTREAM_MODE:-auto}  # auto | manual
+
+LAN_IP() {
+	ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -n "$ip" ] && { echo "$ip"; return; }
+	ip=$(ip -4 addr show dev br-lan 2>/dev/null | awk '/inet /{sub(/\/.*/,"",$2); print $2; exit}')
+	[ -n "$ip" ] && { echo "$ip"; return; }
+	echo 172.16.1.1
+}
+
+DIRTY=0
+LOG_TTY=0
+[ -t 1 ] && LOG_TTY=1
+
+log() {
+	logger -t dns-switch "$*" 2>/dev/null
+	[ "$LOG_TTY" = 1 ] && echo "$*"
+	return 0
+}
+
+die() { log "错误：$*"; exit 1; }
+
+# ---------- 并发锁 ----------
+mkdir -p /var/lock 2>/dev/null
+exec 9>"$LOCK" 2>/dev/null
+lock_take() { flock -n 9 2>/dev/null; }
+lock_drop() { flock -u 9 2>/dev/null; }
+
+# ---------- 状态写入（值不变不写 flash） ----------
+st_set() {
+	[ "$(t_opt "$1")" = "$2" ] && return 0
+	uci -q set "$CFG.status.$1=$2"
+	DIRTY=1
+}
+st_commit() {
+	[ "$DIRTY" = 1 ] || return 0
+	uci -q commit "$CFG" && DIRTY=0
+	DIRTY=0
+}
+
+need_cfg() {
+	if [ ! -f /etc/config/$CFG ]; then
+		ensure_config
+		return 0
+	fi
+	# 出厂 payload 只带 settings；从旧版本升上来也可能缺 status 段。
+	# uci set 不会自动创建命名段，status 段不在时所有 st_set 都是空写，
+	# 页面和 status 会永远显示上一次的值。这里补一个空壳。
+	if [ -z "$(uci -q get "$CFG.status" 2>/dev/null)" ]; then
+		uci -q set "$CFG.status=status" || return 1
+		uci -q commit "$CFG"
+		log "补建 status 段"
+	fi
+	return 0
+}
+
+ensure_config() {
+	[ -f /etc/config/$CFG ] && return 0
+	log "初始化 $CFG 配置"
+	cat > /etc/config/$CFG <<EOF
+config settings 'settings'
+	option mode 'off'
+	option adh_ip '$ADH'
+	option adh_port '$ADH_PORT'
+	option fallback_dns '$FB'
+	option fallback_dns6 ''
+	option probe_domain '$PROBE_DOMAIN'
+	option adh_mac ''
+	option dot853 'allow'
+	option upstream_mode 'auto'
+	option isp_list4 '202.103.224.68 202.103.225.68'
+	option isp_list6 ''
+	option auto_failover '1'
+	option probe_now '0'
+	option request_at '0'
+
+config status 'status'
+	option effective 'off'
+	option probe 'unknown'
+	option reason 'factory-default'
+	option adh_mac ''
+	option upstream ''
+	option last_change '0'
+	option error ''
+	option conflict 'none'
+	option conflict_by ''
+	option conflict_msg ''
+	option conflict_fix ''
+EOF
+	uci -q commit "$CFG"
+}
+
+# ---------- 运营商 DNS（实时，不硬编码） ----------
+isp_dns() {
+	# 手动模式：IPv4 与 IPv6 分开填，各自输出；都空则退回自动
+	if [ "$UPSTREAM_MODE" = "manual" ]; then
+		m4=$(uci -q get dns_switch.settings.isp_list4 2>/dev/null)
+		m6=$(uci -q get dns_switch.settings.isp_list6 2>/dev/null)
+		# 兼容旧版本的单行 isp_list
+		if [ -z "$m4$m6" ]; then
+			legacy=$(uci -q get dns_switch.settings.isp_list 2>/dev/null)
+			[ -n "$legacy" ] && m4="$legacy"
+		fi
+		if [ -n "$m4$m6" ]; then
+			[ -n "$m4" ] && echo $m4
+			[ -n "$m6" ] && echo $m6
+			return
+		fi
+	fi
+
+	found=0
+	if [ -s "$RESOLV_AUTO" ]; then
+		for a in $(awk '/^nameserver/{print $2}' "$RESOLV_AUTO" 2>/dev/null); do
+			case "$a" in
+				127.*|::1|"$ADH"|"$FB") continue ;;
+			esac
+			echo "$a"
+			found=1
+		done
+	fi
+	if [ "$found" = 0 ]; then
+		echo 202.103.224.68
+		echo 202.103.225.68
+	fi
+}
+
+# ---------- 探测 ----------
+# 必须双条件：只测 53 会被"exchange 模式下 dnsmasq 从 1745 顶上来"骗过
+probe_adh() {
+	# 演练钩子：文件在有效期内就当作 ADH 失联
+	if [ -f "$PROBE_FAIL_FLAG" ]; then
+		age=$(( $(date +%s) - $(cat "$PROBE_FAIL_FLAG" 2>/dev/null || echo 0) ))
+		if [ "$age" -lt "$PROBE_FAIL_TTL" ]; then
+			return 1
+		fi
+		# 演练被强杀，标记过期了，自己收拾掉
+		rm -f "$PROBE_FAIL_FLAG"
+		log "演练标记已过期（${age}s），自动清除"
+	fi
+	code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$ADH:$ADH_PORT/" 2>/dev/null)
+	[ -n "$code" ] || return 1
+	[ "$code" != "000" ] || return 1
+	nslookup "$PROBE_DOMAIN" "$ADH" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+probe_reason() {
+	code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$ADH:$ADH_PORT/" 2>/dev/null)
+	if [ -z "$code" ] || [ "$code" = "000" ]; then
+		echo "Web $ADH_PORT 不通（AdGuardHome 未运行或地址不对）"
+		return
+	fi
+	if ! nslookup "$PROBE_DOMAIN" "$ADH" >/dev/null 2>&1; then
+		echo "Web 有响应但解析失败（ADH 上游不可用）"
+		return
+	fi
+	echo "正常"
+}
+
+fb_reach() {
+	[ -n "$FB" ] || { echo "未配置"; return; }
+	if ping -c1 -W1 "$FB" >/dev/null 2>&1; then echo "可达"; else echo "不可达"; fi
+}
+
+# ============================================================
+# 冲突检测（P0-5）
+#
+# 为什么必须有：整条劫持链是 `redirect to :53`。一旦 53 的归属变了——
+# dnsmasq 被挪到 1745、或本机 AdGuardHome/SmartDNS 抢了 53——redirect
+# 仍然"成功"，流量却打到了另一个解析器。故障是静默的：nft 规则在位、
+# uci 写着 ADH、页面亮绿灯，只有客户端解析悄悄走错路。
+#
+# 所以这里不只看配置，还要看内核里 53 到底被谁 bind。
+# ============================================================
+
+# OpenWrt 生态里会抢 53 的 DNS 后端：进程名 uci配置名 init脚本 人话名
+known_dns_daemons() {
+	cat <<'EOF'
+AdGuardHome adguardhome adguardhome 本机 AdGuardHome
+smartdns smartdns smartdns SmartDNS
+mosdns mosdns mosdns MosDNS
+unbound unbound unbound Unbound
+dnscrypt-proxy dnscrypt-proxy dnscrypt-proxy dnscrypt-proxy
+https-dns-proxy https-dns-proxy https-dns-proxy https-dns-proxy
+dnsproxy dnsproxy dnsproxy dnsproxy
+pdnsd pdnsd pdnsd pdnsd
+EOF
+}
+
+# 人话名 → init 脚本名（拼修复命令用）
+init_of_name() {
+	while read -r _p _c i n; do
+		[ "$n" = "$1" ] && { echo "$i"; return 0; }
+	done <<EOF
+$(known_dns_daemons)
+EOF
+	echo "$1"
+}
+
+# 绑在 53 上的 socket inode（UDP/TCP、v4/v6 全看）
+sock53_inodes() {
+	for f in /proc/net/udp /proc/net/tcp /proc/net/udp6 /proc/net/tcp6; do
+		[ -r "$f" ] || continue
+		awk 'NR > 1 { split($2, a, ":"); if (a[2] == "0035") print $10 }' "$f" 2>/dev/null
+	done | sort -u
+}
+
+pid_of_inode() {
+	want="socket:[$1]"
+	n=0
+	for d in /proc/[0-9]*; do
+		[ -d "$d/fd" ] || continue
+		for fd in "$d"/fd/*; do
+			n=$((n + 1))
+			[ "$n" -gt 6000 ] && return 1     # 兜底，别让一次扫描拖住 tick
+			[ "$(readlink "$fd" 2>/dev/null)" = "$want" ] || continue
+			echo "${d#/proc/}"
+			return 0
+		done
+	done
+	return 1
+}
+
+# 53 上的 socket 是否全部属于 dnsmasq（只遍历 dnsmasq 自己的 fd，很便宜）
+# 常态下用它代替全进程表扫描：既确认了归属，又不每轮翻 /proc
+dnsmasq_owns_53() {
+	ins=$(sock53_inodes)
+	[ -n "$ins" ] || return 1
+	mine=" "
+	for p in $(pidof dnsmasq); do
+		[ -d "/proc/$p/fd" ] || continue
+		for fd in "/proc/$p"/fd/*; do
+			t=$(readlink "$fd" 2>/dev/null)
+			case "$t" in
+				socket:\[*\]) t=${t#socket:[}; mine="$mine${t%]} " ;;
+			esac
+		done
+	done
+	for i in $ins; do
+		case "$mine" in *" $i "*) continue ;; esac
+		return 1
+	done
+	return 0
+}
+
+# 占着 53 的进程名，逗号分隔
+who_listens_53() {
+	s=""
+	for ino in $(sock53_inodes); do
+		p=$(pid_of_inode "$ino")
+		if [ -n "$p" ]; then
+			c=$(cat "/proc/$p/comm" 2>/dev/null)
+			c=${c:-pid$p}
+		else
+			c="未知进程(inode $ino)"
+		fi
+		case ",$s," in *",$c,"*) continue ;; esac
+		s="${s:+$s,}$c"
+	done
+	echo "$s"
+}
+
+# 扫描结果写入四个全局变量，返回码 0=可用、1=会阻断切换
+# $1=wait 时对"dnsmasq 还没起好"多等一轮，避免开机瞬间误报
+conflict_scan() {
+	CONFLICT_LEVEL=none
+	CONFLICT_BY=""
+	CONFLICT_WHY=""
+	CONFLICT_FIX=""
+
+	dm_port=$(uci -q get dhcp.@dnsmasq[0].port 2>/dev/null)
+	[ -n "$dm_port" ] || dm_port=53
+
+	# 先做便宜的检查：别的 DNS 后端有没有在跑 / 有没有开机自启
+	alive=""
+	autostart=""
+	while read -r proc ucfg init name; do
+		[ -n "${proc:-}" ] || continue
+		pidof "$proc" >/dev/null 2>&1 && alive="${alive:+$alive, }$name"
+		# init 的 enabled 只反映 /etc/rc.d 链接；adguardhome 这类另有 config.enabled 开关，
+		# 而 r68s 出厂就是 enabled='0'（二进制装着但不许自启），不排掉会常年误报
+		if [ -x "/etc/init.d/$init" ] && /etc/init.d/"$init" enabled >/dev/null 2>&1; then
+			own=$(uci -q get "$ucfg.config.enabled" 2>/dev/null)
+			[ "$own" = "0" ] || autostart="${autostart:+$autostart, }$name"
+		fi
+	done <<EOF
+$(known_dns_daemons)
+EOF
+
+	# 常态：dnsmasq 在 53、没有别的后端。这条路径只查 dnsmasq 自己的 fd，零开销
+	if [ "$dm_port" = "53" ] && [ -z "$alive" ] && dnsmasq_owns_53; then
+		return 0
+	fi
+
+	who=$(who_listens_53 2>/dev/null)
+	foreign=""
+	i="$who"
+	while [ -n "$i" ]; do
+		cur=${i%%,*}
+		case "$i" in *,*) i=${i#*,} ;; *) i="" ;; esac
+		case "$cur" in ""|dnsmasq*) continue ;; esac
+		foreign="${foreign:+$foreign, }$cur"
+	done
+
+	# 判据 1：dnsmasq 不在 53，redirect to :53 已经打不到它
+	if [ "$dm_port" != "53" ]; then
+		CONFLICT_LEVEL=block
+		if [ -n "$foreign" ]; then
+			CONFLICT_BY=$foreign
+			CONFLICT_WHY="dnsmasq 被挪到 $dm_port 端口，53 已归 $foreign 所有"
+		elif [ -n "$alive" ]; then
+			CONFLICT_BY=$alive
+			CONFLICT_WHY="dnsmasq 被挪到 $dm_port 端口，$alive 在运行并可能接管了 53"
+		else
+			CONFLICT_BY=dnsmasq
+			CONFLICT_WHY="dnsmasq 被挪到 $dm_port 端口，53 上没有任何解析器在听"
+		fi
+		CONFLICT_FIX="uci delete dhcp.@dnsmasq[0].port && /etc/init.d/dnsmasq restart"
+		return 1
+	fi
+
+	# 判据 2：53 上是别人——dnsmasq 后启动也抢不过先绑的
+	if [ -n "$foreign" ]; then
+		CONFLICT_LEVEL=block
+		CONFLICT_BY=$foreign
+		CONFLICT_WHY="$foreign 绑定了 53，劫持流量不会落到 dnsmasq"
+		CONFLICT_FIX="/etc/init.d/$(init_of_name "${foreign%%,*}") stop"
+		return 1
+	fi
+
+	# 判据 3：53 上没有任何解析器在听
+	if ! pidof dnsmasq >/dev/null 2>&1; then
+		# 开机/重启瞬间 dnsmasq 可能还在起，等一下再判，别把"还没起来"当成冲突
+		[ "${1:-}" = "wait" ] && sleep 3
+	fi
+	if ! pidof dnsmasq >/dev/null 2>&1; then
+		CONFLICT_LEVEL=block
+		CONFLICT_BY=dnsmasq
+		CONFLICT_WHY="dnsmasq 未运行，53 上没有解析器"
+		CONFLICT_FIX="/etc/init.d/dnsmasq start"
+		return 1
+	fi
+	if ! dnsmasq_owns_53; then
+		[ "${1:-}" = "wait" ] && { sleep 2; dnsmasq_owns_53; }
+	fi
+	if ! dnsmasq_owns_53; then
+		CONFLICT_LEVEL=block
+		CONFLICT_BY=dnsmasq
+		CONFLICT_WHY="dnsmasq 在运行，但 53 上没有它的监听地址（劫持流量无处可去）"
+		CONFLICT_FIX="检查 dhcp.@dnsmasq[0] 的 interface / listen_address 是否漏了 br-lan"
+		return 1
+	fi
+
+	# 判据 4：眼下没抢，但另一套后端在跑——重启顺序一变就换人
+	if [ -n "$alive" ]; then
+		CONFLICT_LEVEL=warn
+		CONFLICT_BY=$alive
+		CONFLICT_WHY="$alive 也在运行，dnsmasq 重启时 53 可能被它抢走"
+		CONFLICT_FIX="/etc/init.d/$(init_of_name "${alive%%,*}") disable   # 不用它就关掉自启"
+		return 0
+	fi
+
+	# 判据 5：开机自启但当前没跑，早晚会撞
+	if [ -n "$autostart" ]; then
+		CONFLICT_LEVEL=warn
+		CONFLICT_BY=$autostart
+		CONFLICT_WHY="$autostart 已设为开机自启，下次重启可能与 dnsmasq 争 53"
+		CONFLICT_FIX="/etc/init.d/$(init_of_name "${autostart%%,*}") disable"
+		return 0
+	fi
+
+	return 0
+}
+
+# 只在真的变了才写 flash + 记日志（tick 55 秒一轮，不能每轮刷）
+st_conflict() {
+	[ "$(t_opt conflict)" = "$1" ] && [ "$(t_opt conflict_by)" = "$2" ] && \
+		[ "$(t_opt conflict_msg)" = "$3" ] && [ "$(t_opt conflict_fix)" = "$4" ] && return 0
+	st_set conflict "$1"
+	st_set conflict_by "$2"
+	st_set conflict_msg "$3"
+	st_set conflict_fix "$4"
+	st_commit
+	case "$1" in
+		block)
+			log "53 端口冲突：$3"
+			ev conflict "53 端口被占用，切换会失效：$3" "$2"
+			;;
+		warn) log "53 端口隐患：$3" ;;
+		*)    log "53 端口冲突已解除" ;;
+	esac
+}
+
+# ---------- nft ----------
+get_mac() {
+	# 手填优先（换了设备、或邻居表取不到时用）
+	if [ -n "$MAC_CFG" ] && echo "$MAC_CFG" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; then
+		echo "$MAC_CFG" | tr 'A-F' 'a-f'
+		return 0
+	fi
+	ping -c1 -W1 "$ADH" >/dev/null 2>&1
+	m=$(ip neigh show to "$ADH" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print $(i+1)}' | head -1)
+	echo "$m" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$' || return 1
+	echo "$m" | tr 'A-F' 'a-f'
+}
+
+build_nft() { # $1=输出文件 $2=MAC（可空）
+	{
+		echo "# 由 dns-switch 生成，请勿手改（改 uci dns_switch 或重跑 dns-switch on）"
+		if [ "$DOT853" = "block" ]; then
+			echo "# 853（DoT/DoQ）策略：拦截"
+		else
+			echo "# 853（DoT/DoQ）策略：放行，本文件不产生任何 853 规则"
+		fi
+		echo "chain dns_hijack {"
+		echo "	type nat hook prerouting priority -95; policy accept;"
+		echo ""
+		if [ -n "$2" ]; then
+			echo "	ether saddr $2 udp dport 53 accept"
+			echo "	ether saddr $2 tcp dport 53 accept"
+		fi
+		echo "	ip saddr $ADH udp dport 53 accept"
+		echo "	ip saddr $ADH tcp dport 53 accept"
+		echo ""
+		echo "	meta nfproto ipv4 udp dport 53 redirect to :53"
+		echo "	meta nfproto ipv4 tcp dport 53 redirect to :53"
+		echo "	meta nfproto ipv6 udp dport 53 redirect to :53"
+		echo "	meta nfproto ipv6 tcp dport 53 redirect to :53"
+		echo "}"
+
+		# 853 拦截：加密 DNS 没法像 53 那样 redirect 到明文，只能 reject
+		if [ "$DOT853" = "block" ]; then
+			echo ""
+			echo "chain dot_block {"
+			echo "	type filter hook forward priority filter + 10; policy accept;"
+			echo ""
+			if [ -n "$2" ]; then
+				echo "	ether saddr $2 tcp dport 853 accept"
+				echo "	ether saddr $2 udp dport 853 accept"
+			fi
+			echo "	ip saddr $ADH tcp dport 853 accept"
+			echo "	ip saddr $ADH udp dport 853 accept"
+			echo ""
+			echo "	tcp dport 853 reject with tcp reset"
+			echo "	udp dport 853 reject"
+			echo "}"
+		fi
+	} > "$1"
+}
+
+# 自动探测 AdGuardHome 的 IPv6 地址
+# 思路：先把 ADH 的 v4 反查成主机名，再从 odhcpd 的 hosts 表里取它的 v6
+# 优先 ULA（fc/fd 开头，不随 PPPoE 前缀变化），没有再用公网地址
+detect_adh_v6() {
+	name=$(nslookup "$ADH" 127.0.0.1 2>/dev/null | awk -F'= *' '/name *=/{print $2; exit}' | sed 's/\.lan$//')
+	[ -n "$name" ] || return 1
+
+	ula=""; gua=""
+	for f in /tmp/hosts/odhcpd.hosts.lan /tmp/hosts/hosts /tmp/hosts/dhcp.cfg*; do
+		[ -f "$f" ] || continue
+		for a in $(awk -v n="$name" '$2 == n { print $1 }' "$f" 2>/dev/null); do
+			case "$a" in
+				fc*|fd*) [ -n "$ula" ] || ula="$a" ;;
+				*:*)     [ -n "$gua" ] || gua="$a" ;;
+			esac
+		done
+	done
+	[ -n "$ula" ] && { echo "$ula"; return 0; }
+	[ -n "$gua" ] && { echo "$gua"; return 0; }
+	return 1
+}
+
+nft_check() { # $1=待检文件；用独立表名当壳，不能用 inet fw4（已存在会报错）
+	{ echo 'table inet _dnsswitch_chk {'; cat "$1"; echo '}'; } | nft -c -f - >/dev/null 2>&1
+}
+
+# 清理历史 853 拦截（今天的实机上已经部署过带 dot_block 的旧文件）
+purge_dot() {   # $1=force 时无视策略强制删（off / rescue 用）
+	if [ "${1:-}" != "force" ] && [ "$DOT853" = "block" ]; then
+		return 0        # 拦截策略下这条链是我们自己生成的，不该删
+	fi
+	if nft list chain inet fw4 dot_block >/dev/null 2>&1; then
+		nft delete chain inet fw4 dot_block 2>/dev/null && log "已移除 853 拦截链（策略=放行）"
+	fi
+	for f in /etc/nftables.d/*.nft; do
+		[ -f "$f" ] || continue
+		[ "$f" = "$NFT_FRAG" ] && continue
+		grep -q 'dot_block' "$f" 2>/dev/null && log "警告：$f 里还有 dot_block 定义，需人工清理"
+	done
+	return 0
+}
+
+# 让内核里的 853 状态跟上策略
+dot_sync() {
+	if [ "$DOT853" = "block" ]; then
+		nft list chain inet fw4 dot_block >/dev/null 2>&1 && return 0
+		[ -f "$NFT_FRAG" ] || return 0
+		fw4 reload >/dev/null 2>&1
+		log "853 拦截链缺失，已按策略重建"
+	else
+		purge_dot force
+	fi
+	return 0
+}
+
+# ---------- uci 操作 ----------
+strip_opt() { # $1=config $2=section $3=option $4=要去掉的 ERE
+	cur=$(uci -q get "$1.$2.$3" 2>/dev/null)
+	[ -n "$cur" ] || return 0
+	new=""
+	for t in $cur; do
+		echo "$t" | grep -Eq "$4" || new="${new:+$new }$t"
+	done
+	uci -q delete "$1.$2.$3"
+	for t in $new; do
+		uci -q add_list "$1.$2.$3=$t"
+	done
+}
+
+set_dhcp_dns() { # $@ = DNS 地址，合成单条 option 6（多条 option 6 dnsmasq 只认第一条）
+	tok="6"
+	for a in "$@"; do
+		[ -n "$a" ] || continue
+		tok="$tok,$a"
+	done
+	strip_opt dhcp lan dhcp_option '^6(,|$)'
+	uci -q add_list "dhcp.lan.dhcp_option=$tok"
+	log "DHCP 下发 DNS → $tok"
+}
+
+set_dnsmasq_upstream() { # $@ = 上游列表（第一条为主）
+	uci -q delete dhcp.@dnsmasq[0].server
+	for a in "$@"; do
+		[ -n "$a" ] || continue
+		uci -q add_list "dhcp.@dnsmasq[0].server=$a"
+	done
+	uci -q set dhcp.@dnsmasq[0].noresolv='1'
+	uci -q set dhcp.@dnsmasq[0].strictorder='1'
+	uci -q set dhcp.@dnsmasq[0].dns_redirect='0'
+}
+
+# ---------- 验证 ----------
+verify_dns() {
+	i=0
+	while [ $i -lt 3 ]; do
+		ok=1
+		nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1 || ok=0
+		nslookup www.qq.com    127.0.0.1 >/dev/null 2>&1 || ok=0
+		[ "$ok" = 1 ] && return 0
+		i=$((i+1))
+		[ $i -lt 3 ] && sleep 2
+	done
+	return 1
+}
+
+# ---------- 回滚 ----------
+rollback() {
+	log "回滚中…"
+	[ -f "$BK/dhcp.bak" ] && cp -f "$BK/dhcp.bak" /etc/config/dhcp && uci -q commit dhcp
+	if [ -f "$BK/frag.bak" ]; then
+		cp -f "$BK/frag.bak" "$NFT_FRAG"
+	else
+		rm -f "$NFT_FRAG"
+	fi
+	nft delete table inet dnsmasq 2>/dev/null
+	fw4 reload >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+		log "回滚完成，解析已恢复"
+		return 0
+	fi
+	log "回滚后仍解析失败，请检查 WAN"
+	return 1
+}
+
+# ============================================================
+# rescue：逃生通道
+#
+# 刻意的取舍：这一整段不调用本文件任何其他函数，不读 dns_switch 配置，
+# 不解析 nft 结构。宁可重复几行代码，也要保证在「配置被改烂 / 脚本别的
+# 部分有 bug / daemon 卡住」的时候它还能跑。
+#
+# 边界：只管 DNS。永不重启，永不碰网络接口。撞上 netifd / netlink 卡死
+# 时它做不了任何事，会明说而不是假装成功——一个会撒谎的急救工具比没有更危险。
+# ============================================================
+do_rescue() {
+	echo "=== dns-switch rescue ==="
+
+	# 1. 先让 daemon 别再把它改回去（失败也无所谓，下一步照样做）
+	uci -q set dns_switch.settings.mode='off' 2>/dev/null
+	uci -q commit dns_switch 2>/dev/null
+	/etc/init.d/dns-switch stop 2>/dev/null
+
+	# 2. 拆掉劫持（fw4 reload 不删孤儿链，必须显式删）
+	rm -f /etc/nftables.d/20-dns-hijack.nft 2>/dev/null
+	nft delete chain inet fw4 dns_hijack 2>/dev/null
+	nft delete chain inet fw4 dot_block 2>/dev/null
+	nft delete table inet dnsmasq 2>/dev/null
+
+	# 3. dnsmasq 复位：只摘 option 6，保留 3, / 42, 这些别的选项
+	uci -q delete dhcp.@dnsmasq[0].server
+	uci -q delete dhcp.@dnsmasq[0].noresolv
+	uci -q delete dhcp.@dnsmasq[0].strictorder
+	uci -q delete dhcp.@dnsmasq[0].dns_redirect
+	uci -q delete dhcp.@dnsmasq[0].port
+	uci -q delete dhcp.lan.dns
+	cur=$(uci -q get dhcp.lan.dhcp_option 2>/dev/null)
+	if [ -n "$cur" ]; then
+		left=""
+		for t in $cur; do
+			case "$t" in
+				6|6,*) ;;
+				*) left="${left:+$left }$t" ;;
+			esac
+		done
+		uci -q delete dhcp.lan.dhcp_option
+		for t in $left; do
+			uci -q add_list "dhcp.lan.dhcp_option=$t"
+		done
+	fi
+	uci -q commit dhcp 2>/dev/null
+
+	# 4. 生效
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	fw4 reload >/dev/null 2>&1
+
+	# 5. 验证
+	sleep 2
+	if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+		echo "OK   DNS 已复位，解析正常。"
+		echo "     守护进程已停止，模式设为 off。要恢复 ADH 请执行 dns-switch on"
+		log "rescue 成功"
+		ev rescue "急救复位成功，DNS 已回到原生" "rc=0"
+		return 0
+	fi
+
+	echo "FAIL DNS 已复位，但仍解析不了。"
+	echo
+	echo "     这基本可以断定不是 DNS 的问题，而是接口或网络服务层："
+	echo "       1. ping -c1 223.5.5.5      发不出去 → WAN 断了"
+	echo "       2. ping -c1 你的网关        不通 → LAN 掉了"
+	echo "       3. ip addr                  命令卡住 → netifd/netlink 卡死"
+	echo
+	echo "     第 3 种是本机已知的出厂缺陷（重启接口后不重建），"
+	echo "     dns-switch 救不了，去看 netguard：logread -e netguard"
+	log "rescue 未能恢复解析，疑似接口层故障"
+	return 1
+}
+
+# ============================================================
+# snapshot：快照与回滚
+# ============================================================
+SNAPDIR=/etc/dns-switch/snapshots
+SNAP_KEEP=10
+
+snap_save() {
+	mkdir -p "$SNAPDIR" || return 1
+	ts=$(date +%Y%m%d-%H%M%S)
+	d="$SNAPDIR/$ts"
+	mkdir -p "$d" || return 1
+
+	cp -f /etc/config/dhcp "$d/dhcp" 2>/dev/null
+	[ -f "$NFT_FRAG" ] && cp -f "$NFT_FRAG" "$d/hijack.nft"
+	uci -q show dns_switch > "$d/dns_switch.uci" 2>/dev/null
+	uci -q get dns_switch.settings.mode > "$d/mode" 2>/dev/null
+
+	# 只留最近 N 份
+	n=$(ls -1 "$SNAPDIR" 2>/dev/null | wc -l)
+	while [ "$n" -gt "$SNAP_KEEP" ]; do
+		old=$(ls -1 "$SNAPDIR" 2>/dev/null | sort | head -1)
+		[ -n "$old" ] || break
+		rm -rf "$SNAPDIR/$old"
+		n=$((n - 1))
+	done
+
+	echo "$ts"
+}
+
+snap_list() {
+	mkdir -p "$SNAPDIR"
+	if [ -z "$(ls -1 "$SNAPDIR" 2>/dev/null)" ]; then
+		echo "还没有快照。执行 dns-switch snapshot save 建一个。"
+		return 0
+	fi
+	printf "%-18s %-8s %s\n" "时间戳" "模式" "上游首项"
+	for d in $(ls -1 "$SNAPDIR" | sort -r); do
+		m=$(cat "$SNAPDIR/$d/mode" 2>/dev/null)
+		u=$(awk '/list server/{print $3; exit}' "$SNAPDIR/$d/dhcp" 2>/dev/null | tr -d "'")
+		printf "%-18s %-8s %s\n" "$d" "${m:-?}" "${u:-空}"
+	done
+}
+
+snap_restore() {
+	d="$SNAPDIR/$1"
+	[ -d "$d" ] || { echo "没有这个快照：$1"; echo "用 dns-switch snapshot 看现有列表"; return 1; }
+	[ -f "$d/dhcp" ] || { echo "快照不完整，缺 dhcp"; return 1; }
+
+	cp -f "$d/dhcp" /etc/config/dhcp
+	uci -q commit dhcp
+
+	# 模式也一起还原，否则会出现「配置是 on、模式是 off」的错位
+	if [ -f "$d/mode" ]; then
+		m=$(cat "$d/mode" 2>/dev/null)
+		if [ -n "$m" ]; then
+			uci -q set "dns_switch.settings.mode=$m"
+			uci -q commit dns_switch 2>/dev/null
+		fi
+	fi
+
+	if [ -f "$d/hijack.nft" ]; then
+		cp -f "$d/hijack.nft" "$NFT_FRAG"
+		nft delete chain inet fw4 dns_hijack 2>/dev/null
+	else
+		rm -f "$NFT_FRAG"
+		nft delete chain inet fw4 dns_hijack 2>/dev/null
+	fi
+
+	nft delete table inet dnsmasq 2>/dev/null
+	fw4 reload >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+
+	# 快照是改动前拍的，可能停在「未下发 DHCP」的瞬间；
+	# 如果回滚后的意图是 on，必须按当前参数重新下发一遍，否则会出现
+	# mode=on 但 option6/RDNSS 为空的错位
+	if [ "$(uci -q get dns_switch.settings.mode 2>/dev/null)" = "on" ]; then
+		do_on >/dev/null 2>&1
+	fi
+
+	sleep 2
+	if nslookup www.baidu.com 127.0.0.1 >/dev/null 2>&1; then
+		ev snapshot "已回滚到快照 $1" "解析正常"
+		echo "OK   已回滚到 $1，解析正常"
+		# 时间戳跟着更新，否则页面会显示一个很旧的「最后切换」
+		uci -q set "dns_switch.status.last_change=$(date +%s)"
+		uci -q commit dns_switch 2>/dev/null
+		# 快照里的模式是 on 就把守护拉起来，别让配置管着没人看
+		if [ "$(uci -q get dns_switch.settings.mode 2>/dev/null)" = "on" ]; then
+			/etc/init.d/dns-switch start >/dev/null 2>&1
+		fi
+		log "快照回滚到 $1"
+		return 0
+	fi
+	echo "FAIL 已回滚配置，但解析仍失败。先执行 dns-switch rescue"
+	log "快照回滚到 $1，但解析失败"
+	return 1
+}
+
+# 单文件差异。设备上没有 diff（busybox 没编进去，rc=127），
+# 早先直接用 diff 的结果是：永远输出「没有差别」——一个永不作声的校验器
+# 比没有校验器更危险。这里用 cmp 判是否相同，再用 awk 出集合差异。
+snap_diff_file() {
+	cmp -s "$1" "$2" 2>/dev/null && return 0
+	awk 'NR == FNR { s[$0] = 1; o[++n] = $0; next }
+	     { t[$0] = 1 }
+	     END {
+		for (i = 1; i <= n; i++)
+			if (o[i] != "" && !(o[i] in t)) printf "  - %s\n", o[i]
+		for (k in t)
+			if (k != "" && !(k in s)) printf "  + %s\n", k
+	     }' "$1" "$2" 2>/dev/null
+}
+
+snap_diff() {
+	a="${1:-}"
+	b="${2:-}"
+	mkdir -p "$SNAPDIR"
+
+	if [ -z "$a" ]; then
+		# 不带参数：比最近两份
+		b=$(ls -1 "$SNAPDIR" 2>/dev/null | sort -r | sed -n 1p)
+		a=$(ls -1 "$SNAPDIR" 2>/dev/null | sort -r | sed -n 2p)
+		if [ -z "$a" ] || [ -z "$b" ]; then
+			echo "至少要两份快照才能比较（现在 $(ls -1 "$SNAPDIR" 2>/dev/null | wc -l) 份）。"
+			return 1
+		fi
+	else
+		[ -d "$SNAPDIR/$a" ] || { echo "找不到快照 $a"; return 1; }
+		[ -n "$b" ] || { echo "用法：dns-switch snapshot diff <旧> <新>"; return 1; }
+		[ -d "$SNAPDIR/$b" ] || { echo "找不到快照 $b"; return 1; }
+	fi
+
+	echo "旧：$a"
+	echo "新：$b"
+	echo
+
+	chg=0
+	for f in mode dhcp hijack.nft dns_switch.uci; do
+		[ -f "$SNAPDIR/$a/$f" ] || [ -f "$SNAPDIR/$b/$f" ] || continue
+		d=$(snap_diff_file "$SNAPDIR/$a/$f" "$SNAPDIR/$b/$f")
+		[ -n "$d" ] || continue
+		chg=1
+		echo "=== $f ==="
+		echo "$d"
+		echo
+	done
+
+	[ "$chg" = 0 ] && echo "两份快照没有差别。"
+	return 0
+}
+
+# ============================================================
+# timeline：事件时间线（P1-4）
+#
+# 记清"什么时候、因为什么、变了什么"。这是排障时唯一能回答
+# "昨天还好，什么时候坏的"的东西。syslog 会被冲掉，这个不会。
+# ============================================================
+ev() {  # $1=kind $2=人话原因 $3=技术细节（可选）
+	[ -n "${1:-}" ] || return 0
+	mkdir -p "${EVENTS%/*}" 2>/dev/null
+	# 必须清掉换行：upstream 这类字段是多行文本，直接写会把一条事件
+	# 拆成好几行，时间线读起来就乱了（实测混进过裸 IP 行）
+	r=$(printf '%s' "${2:-}" | tr '\n\r\t' '   ')
+	d=$(printf '%s' "${3:-}" | tr '\n\r\t' '   ')
+	printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$1" "$r" "$d" >> "$EVENTS" 2>/dev/null
+	return 0
+}
+
+# 只保留 TL_KEEP_DAYS 天。调用点在 do_init / do_on 这类低频路径上，
+# 不放 tick 里——55 秒一次跑 awk 没必要。
+ev_prune() {
+	[ -f "$EVENTS" ] || return 0
+	cut=$(( $(date +%s) - TL_KEEP_DAYS * 86400 ))
+	awk -F'\t' -v c="$cut" 'NF && ($1 + 0) >= c' "$EVENTS" > "$EVENTS.tmp" 2>/dev/null \
+		&& mv "$EVENTS.tmp" "$EVENTS"
+	return 0
+}
+
+do_timeline() {
+	n="${1:-20}"
+	case "$n" in ''|*[!0-9]*) n=20 ;; esac
+	if [ ! -f "$EVENTS" ] || [ ! -s "$EVENTS" ]; then
+		echo "还没有事件记录。切换一次、或做个演练就有了。"
+		return 0
+	fi
+	echo "最近 $n 条事件（保留 ${TL_KEEP_DAYS} 天）"
+	echo
+	tail -n "$n" "$EVENTS" | awk -F'\t' '
+		function cn(k,  s) {
+			s = k
+			if (k == "on")            s = "切换启用"
+			else if (k == "off")      s = "切回原生"
+			else if (k == "failover") s = "自动降级"
+			else if (k == "recover")  s = "自动回切"
+			else if (k == "drift")    s = "发现漂移"
+			else if (k == "repair")   s = "自动修复"
+			else if (k == "conflict") s = "端口冲突"
+			else if (k == "drill")    s = "链路演练"
+			else if (k == "rescue")   s = "急救复位"
+			else if (k == "snapshot") s = "快照回滚"
+			else if (k == "bundle")   s = "诊断包"
+			return s
+		}
+		NF >= 3 {
+			printf "%s  [%s]  %s\n", strftime("%m-%d %H:%M:%S", $1 + 0), cn($2), $3
+		}
+	'
+	return 0
+}
+
+# ============================================================
+# 动作：bundle（P1-1）
+#
+# 打一个能交给别人看的诊断包。目标是"换一台机器也能照着复现问题"，
+# 所以收证据不收结论：内核态、配置、解析实测、运行态、日志、内核消息。
+#
+# 落在 /tmp 而不是 /etc：这是一次性产物，不该占 flash，也不该跟着
+# 系统备份一起走。
+# ============================================================
+do_bundle() {
+	need_cfg
+
+	ts=$(date +%Y%m%d-%H%M%S)
+	work="/tmp/dns-switch-bundle-$ts"
+	out="/tmp/dns-switch-bundle-$ts.tar.gz"
+	mkdir -p "$work" || { echo "建目录失败"; return 1; }
+
+	echo "正在收集…"
+
+	{
+		echo "# dns-switch 诊断包"
+		echo "生成时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+		echo "主机名:   $(uci -q get system.@system[0].hostname)"
+		echo "固件:     $(tr '\n' ' ' < /etc/openwrt_release 2>/dev/null)"
+		echo "内核:     $(uname -a)"
+		echo
+		echo "## dns-switch status"
+		do_status 2>&1
+	} > "$work/01-manifest.txt" 2>&1
+
+	{
+		echo "## /etc/config/dns_switch"
+		cat /etc/config/dns_switch 2>/dev/null
+		echo
+		echo "## dhcp 相关段"
+		uci -q show dhcp.@dnsmasq[0] 2>/dev/null
+		uci -q show dhcp.lan 2>/dev/null
+	} > "$work/02-config.txt" 2>&1
+
+	{
+		echo "## dns_hijack"
+		nft list chain inet fw4 dns_hijack 2>&1
+		echo
+		echo "## dot_block"
+		nft list chain inet fw4 dot_block 2>&1
+		echo
+		echo "## /etc/nftables.d 片段"
+		cat "$NFT_FRAG" 2>/dev/null
+	} > "$work/03-nft.txt" 2>&1
+
+	{
+		echo "## 走本机（经 dnsmasq）"
+		for d in "$PROBE_DOMAIN" www.qq.com github.com; do
+			echo "--- $d"
+			nslookup "$d" 127.0.0.1 2>&1 | tail -4
+		done
+		echo
+		echo "## 直连 ADH"
+		nslookup "$PROBE_DOMAIN" "$ADH" 2>&1 | tail -4
+		echo
+		echo "## 53 端口监听者"
+		for f in /proc/net/udp /proc/net/tcp; do
+			awk 'NR>1{split($2,a,":"); if(a[2]=="0035") print FILENAME, a[1], $10}' "$f" 2>/dev/null
+		done
+		echo
+		echo "## 默认路由"
+		ip route show default 2>&1
+	} > "$work/04-resolve.txt" 2>&1
+
+	{
+		echo "## 相关进程"
+		ps w 2>/dev/null | grep -E 'dns-switch|dnsmasq|AdGuard' | grep -v grep
+		echo
+		echo "## 53 端口相关连接（前 40 条）"
+		grep -E 'dport=53|sport=53' /proc/net/nf_conntrack 2>/dev/null | head -40
+	} > "$work/05-runtime.txt" 2>&1
+
+	{
+		echo "## dns-switch 日志"
+		logread -e dns-switch 2>/dev/null
+		echo
+		echo "## 时间线（epoch / kind / reason / detail）"
+		cat "$EVENTS" 2>/dev/null
+		echo
+		echo "## 内核消息尾部"
+		dmesg 2>/dev/null | tail -40
+	} > "$work/06-logs.txt" 2>&1
+
+	tar -czf "$out" -C /tmp "$(basename "$work")" 2>/dev/null \
+		|| { echo "打包失败"; rm -rf "$work"; return 1; }
+	rm -rf "$work"
+
+	echo "已生成：$out"
+	echo "大小：  $(du -h "$out" 2>/dev/null | awk '{print $1}')"
+	echo
+	echo "拿出去：scp root@$(uci -q get network.lan.ipaddr):$out ."
+	ev bundle "生成诊断包" "$(basename "$out")"
+	return 0
+}
+
+# ============================================================
+# 动作：drill（P0-6）
+#
+# 真跑一遍降级与回切，不靠模拟。做法是放一个"探测必失败"的标记，
+# 让 probe_adh 判 ADH 失联，然后驱动 tick 走完 降级 → 回切。
+#
+# 为什么不改 adh_ip、也不真去关 ADH：
+#   - 改 adh_ip 会触发漂移修复，把 dnsmasq 上游换成黑洞，真的断网
+#   - 关 ADH 要登录玩客云，演练不该有外部依赖
+#   标记文件只影响"探测结论"，一个字节的配置都不碰，还能自动过期。
+# ============================================================
+do_drill() {
+	need_cfg
+
+	mode=$(s_opt mode); mode=${mode:-off}
+	if [ "$mode" != "on" ]; then
+		echo "当前是「未启用」状态，没有降级链可演练。"
+		echo "先执行 dns-switch on，再来演练。"
+		return 1
+	fi
+
+	echo "=== DNS 链路演练 ==="
+	echo
+	echo "会真跑一遍「ADH 失联 → 自动降级 → 恢复 → 自动回切」。"
+	echo "全程 DNS 仍可用（降级后走运营商），只是这一两分钟不过滤广告。"
+	echo "通常 30 秒内完成。"
+	echo
+
+	orig_eff=$(t_opt effective)
+
+	# 演练不受冷却限制。刚切换过的话，真实降级要等 COOLDOWN 秒才允许，
+	# 但演练要验的是"能不能降级"，不是"计时器准不准"，卡在这里就没意义了。
+	rm -f "$ST_COOL"
+
+	# 前置体检：这些条件下演练没有意义，还会给出错误结论
+	conflict_scan
+	if [ "$CONFLICT_LEVEL" = "block" ]; then
+		echo "53 端口被占用（$CONFLICT_BY），演练没有意义。"
+		echo "先修好：$CONFLICT_FIX"
+		return 1
+	fi
+	if ! ip route show default 2>/dev/null | grep -q '^default'; then
+		echo "WAN 未就绪（没有默认路由），演练会误判。等联网后再试。"
+		return 1
+	fi
+
+	# 任何退出路径都要清掉标记，否则会把 ADH 判成永久失联
+	trap 'rm -f "$PROBE_FAIL_FLAG"' EXIT INT TERM
+
+	echo "[1/4] 让系统认为 AdGuardHome 失联…"
+	date +%s > "$PROBE_FAIL_FLAG"
+
+	# 变量名必须和 do_tick 调用链里的区分开：conflict_scan / verify_dns
+	# 都在写全局 i，drill 用 i 会被覆盖成无意义的值（实测被写成 2277024），
+	# 导致循环一次都进不去。shell 没有局部作用域，只能靠命名隔离。
+	drill_n=0
+	got=""
+	while [ "$drill_n" -lt 4 ]; do
+		do_tick >/dev/null 2>&1
+		got=$(t_opt effective)
+		[ "$got" = "failover" ] && break
+		drill_n=$((drill_n + 1))
+		sleep 2
+	done
+	if [ "$got" != "failover" ]; then
+		echo "      ✗ 没有进入降级状态（当前实际生效：$got）"
+		ev drill "演练失败：未能触发降级" "effective=$got"
+		trap - EXIT INT TERM
+		return 1
+	fi
+	echo "      ✓ 已自动降级到运营商"
+
+	echo "[2/4] 验证降级后还能解析…"
+	if nslookup "$PROBE_DOMAIN" 127.0.0.1 >/dev/null 2>&1; then
+		echo "      ✓ 解析正常"
+	else
+		echo "      ✗ 降级后仍解析失败——问题在 WAN，不在 DNS"
+		ev drill "演练失败：降级后无法解析" "问题在 WAN 不在 DNS"
+		trap - EXIT INT TERM
+		return 1
+	fi
+
+	echo "[3/4] 恢复 AdGuardHome，等它自动切回…"
+	rm -f "$PROBE_FAIL_FLAG"
+	# 演练不等冷却：真实场景回切要等 COOLDOWN 秒，这里要验的是"能不能回切"
+	rm -f "$ST_COOL"
+
+	drill_n=0
+	got=""
+	while [ "$drill_n" -lt 10 ]; do
+		do_tick >/dev/null 2>&1
+		got=$(t_opt effective)
+		[ "$got" = "on" ] && break
+		drill_n=$((drill_n + 1))
+		sleep 2
+	done
+	if [ "$got" != "on" ]; then
+		echo "      ✗ 没有自动回切（当前实际生效：$got）"
+		ev drill "演练失败：未自动回切" "effective=$got"
+		trap - EXIT INT TERM
+		return 1
+	fi
+	echo "      ✓ 已自动切回 AdGuardHome"
+
+	echo "[4/4] 确认最终状态…"
+	if nslookup "$PROBE_DOMAIN" 127.0.0.1 >/dev/null 2>&1; then
+		echo "      ✓ 解析正常"
+	else
+		echo "      ✗ 回切后解析异常"
+		ev drill "演练失败：回切后无法解析" ""
+		trap - EXIT INT TERM
+		return 1
+	fi
+
+	echo
+	echo "演练通过：失联会降级，恢复会回切，两段都自动完成。"
+	echo "（演练跳过了 ${COOLDOWN} 秒冷却——真实场景里回切在冷却结束后发生。）"
+	echo "这次演练已记入时间线：dns-switch timeline"
+	ev drill "演练通过：降级与回切均自动完成" "orig=$orig_eff final=$got"
+	trap - EXIT INT TERM
+	return 0
+}
+
+# ============================================================
+# 动作：on
+# ============================================================
+do_on() {
+	need_cfg
+
+	# 1. 闸门：探测不到就什么都不改
+	if ! probe_adh; then
+		sleep 2
+		if ! probe_adh; then
+			r=$(probe_reason)
+			log "闸门拒绝：ADH 不可用（$r），未做任何改动"
+			st_set probe fail
+			st_set error "ADH 不可达：$r"
+			st_commit
+			[ "$LOG_TTY" = 1 ] && echo
+			return 2
+		fi
+	fi
+
+	# 2. 守卫：53 必须真的归 dnsmasq，否则劫持链是静默失效的
+	conflict_scan
+	st_conflict "$CONFLICT_LEVEL" "$CONFLICT_BY" "$CONFLICT_WHY" "$CONFLICT_FIX"
+	if [ "$CONFLICT_LEVEL" = "block" ]; then
+		log "守卫拒绝：53 端口冲突（$CONFLICT_BY），未做任何改动"
+		st_set probe fail
+		st_set error "53 端口：$CONFLICT_WHY。修复：$CONFLICT_FIX"
+		st_commit
+		[ "$LOG_TTY" = 1 ] && echo "修复命令：$CONFLICT_FIX"
+		return 2
+	fi
+	if [ "$CONFLICT_LEVEL" = "warn" ]; then
+		log "守卫提醒：$CONFLICT_WHY（继续切换）"
+	fi
+
+	# 3. 备份
+	mkdir -p "$BK" || { log "无法创建 $BK"; return 1; }
+	snap_save >/dev/null 2>&1
+	cp -f /etc/config/dhcp "$BK/dhcp.bak" 2>/dev/null
+	[ -f "$BK/original-dhcp" ] || cp -f /etc/config/dhcp "$BK/original-dhcp" 2>/dev/null
+	[ -f "$NFT_FRAG" ] && cp -f "$NFT_FRAG" "$BK/frag.bak" || rm -f "$BK/frag.bak"
+	log "已备份到 $BK"
+
+	# 4. MAC（用于 IPv6 豁免，跨前缀/重刷不变）
+	MAC=$(get_mac) || MAC=""
+	if [ -n "$MAC" ]; then
+		log "玩客云 MAC：$MAC"
+	else
+		log "取不到玩客云 MAC，本次仅豁免 IPv4（ADH 请只用 IPv4 上游）"
+	fi
+
+	# 5. 生成并预检 nft
+	build_nft "$NFT_FRAG.new" "$MAC"
+	if ! nft_check "$NFT_FRAG.new"; then
+		log "nft 预检失败，去掉 ether 匹配重试"
+		MAC=""
+		build_nft "$NFT_FRAG.new" ""
+		if ! nft_check "$NFT_FRAG.new"; then
+			rm -f "$NFT_FRAG.new"
+			log "nft 预检仍失败，放弃（配置未改）"
+			return 4
+		fi
+	fi
+
+	# 6. uci
+	ISP=$(isp_dns)
+	# 主 DNS 恒为 AdGuardHome：v4 用配置的地址，v6 自动探测
+	P6=$(detect_adh_v6) || P6=""
+	[ -n "$P6" ] && log "自动探测到 ADH 的 IPv6：$P6"
+	set_dnsmasq_upstream "$ADH" $ISP
+	set_dhcp_dns "$ADH" "$FB"
+	# RDNSS（IPv6 的 DNS 只能走这里，option 6 装不下 v6）
+	uci -q delete dhcp.lan.dns
+	r6="$P6 $FB6"
+	[ -n "$(echo $r6)" ] || r6=""
+	if [ -n "$r6" ]; then
+		for a in $r6; do uci -q add_list "dhcp.lan.dns=$a"; done
+		log "RDNSS 下发 IPv6 DNS → $(echo $r6)"
+	else
+		log "未配置且未探测到 IPv6 DNS，RDNSS 保持为空"
+	fi
+	if ! uci -q commit dhcp; then
+		rm -f "$NFT_FRAG.new"
+		cp -f "$BK/dhcp.bak" /etc/config/dhcp 2>/dev/null
+		uci -q commit dhcp 2>/dev/null
+		log "uci commit 失败，已还原 dhcp"
+		return 4
+	fi
+
+	# 7. 落地 + 放行 853
+	mv -f "$NFT_FRAG.new" "$NFT_FRAG"
+	chmod 644 "$NFT_FRAG" 2>/dev/null
+	purge_dot
+	nft delete table inet dnsmasq 2>/dev/null
+	if ! fw4 reload; then
+		log "fw4 reload 失败"
+		rollback
+		st_set error "fw4 reload 失败，已回滚"
+		st_commit
+		return 3
+	fi
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	dot_sync
+
+	# 8. 自检
+	if ! verify_dns; then
+		log "应用后解析失败，自动回滚"
+		rollback
+		st_set effective off
+		st_set probe fail
+		st_set error "应用后解析失败，已自动回滚"
+		st_commit
+		return 3
+	fi
+	if ! nft list chain inet fw4 dns_hijack >/dev/null 2>&1; then
+		log "劫持链未生效（fw4 未 include？），自动回滚"
+		rollback
+		st_set error "dns_hijack 链不存在，已回滚"
+		st_commit
+		return 3
+	fi
+
+	# 9. 状态
+	: > "$ST_FAIL"; : > "$ST_SUCC"
+	st_set effective on
+	st_set probe ok
+	st_set reason "adh-primary"
+	st_set adh_mac "$MAC"
+	st_set upstream "$ADH $(echo $ISP)"
+	st_set last_change "$(date +%s)"
+	st_set error ""
+	st_set applied_sig "$(sig_now)"
+	st_commit
+	date +%s > "$ST_CHECK"
+	log "已切换：全屋 DNS 走 AdGuardHome（$ADH）"
+	ev on "全屋 DNS 走 AdGuardHome" "adh=$ADH upstream=$(s_opt upstream_mode)"
+	return 0
+}
+
+# 关键参数的签名：只有这些变了才需要重新下发，避免每次保存都抖一下
+sig_now() {
+	echo "$ADH|$ADH_PORT|$FB|$FB6|$DOT853|$MAC_CFG|$UPSTREAM_MODE|$(uci -q get dns_switch.settings.isp_list4 2>/dev/null)|$(uci -q get dns_switch.settings.isp_list6 2>/dev/null)"
+}
+
+# 判断"配置和链看起来已经是 on 态"，用于开机跳过重复应用（避免每次启动都重启 dnsmasq）
+state_looks_on() {
+	first=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | awk '{print $1}')
+	[ "$first" = "$ADH" ] || return 1
+	uci -q get dhcp.lan.dhcp_option 2>/dev/null | grep -q "6,$ADH" || return 1
+	[ -f "$NFT_FRAG" ] || return 1
+	nft list chain inet fw4 dns_hijack >/dev/null 2>&1 || return 1
+	return 0
+}
+
+# ============================================================
+# 动作：off
+# ============================================================
+do_off() {
+	need_cfg
+	snap_save >/dev/null 2>&1
+
+	# 已经是原生态且无残留：不重启 dnsmasq，避免无谓的 2 秒抖动
+	already=1
+	[ -f "$NFT_FRAG" ] && already=0
+	uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -qw "$ADH" && already=0
+	uci -q get dhcp.lan.dhcp_option 2>/dev/null | grep -q "6,$ADH" && already=0
+	nft list chain inet fw4 dns_hijack >/dev/null 2>&1 && already=0
+	if [ "$already" = 1 ]; then
+		uci -q set "$CFG.settings.mode=off"
+		DIRTY=1
+		st_set effective off
+		st_set probe unknown
+		st_set reason "factory-default"
+		st_set adh_mac ""
+		st_commit
+		purge_dot force
+		log "已是原生 DNS，无需改动"
+		return 0
+	fi
+
+	rm -f "$NFT_FRAG"
+	# fw4 reload 是增量应用，配置里消失的链不会被删（实测确认），必须显式删
+	nft delete chain inet fw4 dns_hijack 2>/dev/null
+	purge_dot force
+	strip_opt dhcp lan dhcp_option '^6(,|$)'
+	uci -q delete dhcp.lan.dns
+	uci -q delete dhcp.@dnsmasq[0].noresolv
+	uci -q delete dhcp.@dnsmasq[0].strictorder
+	uci -q delete dhcp.@dnsmasq[0].server
+	uci -q delete dhcp.@dnsmasq[0].dns_redirect
+	uci -q delete dhcp.@dnsmasq[0].min_cache_ttl
+	uci -q delete dhcp.@dnsmasq[0].use_stale_cache
+	uci -q commit dhcp
+
+	nft delete table inet dnsmasq 2>/dev/null
+	fw4 reload >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+
+	ok=0
+	if verify_dns; then
+		ok=1
+	else
+		# off 失败不回滚成 on：越故障越要回到原生
+		log "恢复原生后解析异常，检查 WAN 与运营商 DNS"
+	fi
+
+	: > "$ST_FAIL"; : > "$ST_SUCC"
+	uci -q set "$CFG.settings.mode=off"
+	DIRTY=1                     # 保证 mode 一定落盘（下面 st_set 可能全部"值未变"）
+	st_set effective off
+	st_set probe unknown
+	st_set reason "factory-default"
+	st_set adh_mac ""
+	st_set upstream "$(echo $(isp_dns))"
+	st_set last_change "$(date +%s)"
+	[ "$ok" = 1 ] && st_set error "" || st_set error "恢复原生后解析异常"
+	st_commit
+	date +%s > "$ST_CHECK"
+	log "已恢复原生 DNS（运营商兜底），853 放行"
+	ev off "全屋 DNS 交还运营商" "853=$DOT853"
+	[ "$ok" = 1 ] && return 0 || return 3
+}
+
+# ============================================================
+# 降级 / 回切（只 reload，不 restart，<1s）
+# ============================================================
+cooling() {
+	[ -f "$ST_COOL" ] || return 1
+	last=$(cat "$ST_COOL" 2>/dev/null)
+	[ -n "$last" ] || return 1
+	now=$(date +%s)
+	[ $((now - last)) -lt $COOLDOWN ]
+}
+
+tier_failover() {
+	ISP=$(isp_dns)
+	set_dnsmasq_upstream $ISP
+	set_dhcp_dns "$(LAN_IP)"
+	uci -q commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	date +%s > "$ST_COOL"
+	if verify_dns; then
+		st_set effective failover
+		st_set upstream "$(echo $ISP)"
+		st_set error ""
+		log "ADH 不可用，已降级到运营商 DNS"
+		ev failover "AdGuardHome 不可达，已自动降级到运营商" "upstream=$ISP"
+	else
+		st_set effective failover
+		st_set error "降级后仍解析失败，问题在 WAN 不在 DNS"
+		log "降级后仍解析失败，问题在 WAN"
+	fi
+	st_set last_change "$(date +%s)"
+	date +%s > "$ST_CHECK"
+	st_commit
+}
+
+tier_on() {
+	# 链不在（例如从 init 失败状态上来）就必须走完整 do_on，否则只有上游没有劫持
+	if [ ! -f "$NFT_FRAG" ] || ! nft list chain inet fw4 dns_hijack >/dev/null 2>&1; then
+		do_on
+		return $?
+	fi
+	ISP=$(isp_dns)
+	set_dnsmasq_upstream "$ADH" $ISP
+	set_dhcp_dns "$ADH" "$FB"
+	uci -q commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	# reload 是异步的，刚发完命令 DNS 还没起来。等一下再判，
+	# 否则会出现「ADH 明明好了，却因为 reload 慢半拍被判失败 → 白等 120 秒冷却」。
+	sleep 1
+	if verify_dns; then
+		# 冷却只在真的切成功之后写。写早了，一次误判就把重试窗口锁死。
+		date +%s > "$ST_COOL"
+		st_set effective on
+		st_set upstream "$ADH $(echo $ISP)"
+		st_set error ""
+		log "ADH 已恢复，回切到 ADH 上游"
+		ev recover "AdGuardHome 恢复，已自动切回" "adh=$ADH"
+	else
+		st_set error "回切 ADH 后解析失败"
+		log "回切后解析失败，保持降级"
+		: > "$ST_SUCC"
+	fi
+	st_set last_change "$(date +%s)"
+	date +%s > "$ST_CHECK"
+	st_commit
+}
+
+# ============================================================
+# tick：守护每轮执行
+# ============================================================
+do_tick() {
+	need_cfg
+	mode=$(s_opt mode); mode=${mode:-off}
+
+	# 每轮对账 53 的归属：被占时停手，别在别人的 53 上做迁移
+	conflict_scan
+	st_conflict "$CONFLICT_LEVEL" "$CONFLICT_BY" "$CONFLICT_WHY" "$CONFLICT_FIX"
+	if [ "$CONFLICT_LEVEL" = "block" ]; then
+		st_set error "53 端口：$CONFLICT_WHY。修复：$CONFLICT_FIX"
+		st_commit
+		date +%s > "$ST_CHECK"
+		return 0
+	fi
+	# 冲突解除后把那条错误清掉，别让页面一直红着
+	case "$(t_opt error)" in
+		"53 端口："*) st_set error ""; st_commit ;;
+	esac
+
+	# 每轮让内核里的 853 状态跟上策略（拦截则确保在，放行则确保不在）
+	dot_sync
+
+	if [ "$mode" = "off" ]; then
+		eff=$(t_opt effective)
+		[ "$eff" = "off" ] || { st_set effective off; st_set reason factory-default; st_commit; }
+		return 0
+	fi
+
+	if ! ip route show default 2>/dev/null | grep -q '^default'; then
+		st_set error "WAN 未就绪，不做迁移"
+		st_commit
+		return 0
+	fi
+
+	eff=$(t_opt effective); eff=${eff:-off}
+	if probe_adh; then
+		: > "$ST_FAIL"
+		old=$(cat "$ST_SUCC" 2>/dev/null || echo 0)
+		echo $((old + 1)) > "$ST_SUCC"
+		if [ "$eff" != "on" ] && [ "$(cat "$ST_SUCC")" -ge "$SUCC_NEED" ] && ! cooling; then
+			tier_on
+		else
+			# 已在 on 态：补漂移（server 首项不是 ADH 或链丢了）
+			if [ "$eff" = "on" ]; then
+				first=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | awk '{print $1}')
+				if [ "$first" != "$ADH" ] || ! nft list chain inet fw4 dns_hijack >/dev/null 2>&1; then
+					log "检测到漂移，重建"
+					ev repair "检测到配置漂移，已自动重建" "first=$first"
+					do_on >/dev/null 2>&1
+				fi
+			fi
+			date +%s > "$ST_CHECK"
+		fi
+	else
+		: > "$ST_SUCC"
+		old=$(cat "$ST_FAIL" 2>/dev/null || echo 0)
+		echo $((old + 1)) > "$ST_FAIL"
+		if [ "$eff" = "on" ] && [ "$(cat "$ST_FAIL")" -ge "$FAIL_NEED" ] && ! cooling; then
+			sleep 2
+			if probe_adh; then
+				: > "$ST_FAIL"
+			else
+				tier_failover
+			fi
+		fi
+		date +%s > "$ST_CHECK"
+	fi
+	return 0
+}
+
+# ============================================================
+# init：开机一次性收敛
+# ============================================================
+do_init() {
+	need_cfg
+	# 开机顺手清掉过期事件，避免时间线无限长（只在低频路径做）
+	ev_prune
+	i=0
+	while [ $i -lt 30 ]; do
+		if ip route show default 2>/dev/null | grep -q '^default'; then break; fi
+		sleep 3
+		i=$((i+1))
+	done
+
+	# 开机第一件事：53 到底归谁。冲突时不静默，也不再往下做迁移
+	conflict_scan wait
+	st_conflict "$CONFLICT_LEVEL" "$CONFLICT_BY" "$CONFLICT_WHY" "$CONFLICT_FIX"
+
+	mode=$(s_opt mode); mode=${mode:-off}
+
+	# 别人占着 53 时强行下发只会把 dnsmasq 改坏，而客户端本来还能解析
+	if [ "$CONFLICT_LEVEL" = "block" ]; then
+		log "启动检测到 53 端口冲突（$CONFLICT_BY），跳过自动迁移：$CONFLICT_WHY"
+		st_set error "53 端口：$CONFLICT_WHY。修复：$CONFLICT_FIX"
+		st_commit
+		date +%s > "$ST_CHECK"
+		return 0
+	fi
+
+	if [ "$mode" = "off" ]; then
+		# 只在检测到漂移时才动手，避免首启无谓重启
+		drift=0
+		[ -f "$NFT_FRAG" ] && drift=1
+		uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | grep -qw "$ADH" && drift=1
+		uci -q get dhcp.lan.dhcp_option 2>/dev/null | grep -q "6,$ADH" && drift=1
+		if [ "$drift" = 1 ]; then
+			log "出厂态但检测到残留，执行收敛"
+			do_off >/dev/null 2>&1
+		else
+			st_set effective off
+			st_set reason factory-default
+			st_commit
+		fi
+		date +%s > "$ST_CHECK"
+		return 0
+	fi
+
+	# mode=on：先看现状对不对，对就只做一次轻量验证，不重启 dnsmasq
+	if state_looks_on && verify_dns; then
+		log "开机检查：ADH 模式已就绪，无需重配"
+		st_set effective on
+		st_set probe ok
+		st_set error ""
+		st_commit
+		date +%s > "$ST_CHECK"
+		return 0
+	fi
+
+	# 配置缺项或解析不通，才真正重配；闸门不过就降到 failover（不阻止开机）
+	if do_on >/dev/null 2>&1; then
+		log "开机收敛：ADH 模式已就绪"
+	else
+		log "开机收敛：ADH 不可用，直接降级运营商"
+		tier_failover
+	fi
+	return 0
+}
+
+# ============================================================
+# apply-intent：procd reload trigger 调用
+# ============================================================
+do_apply_intent() {
+	need_cfg
+	if [ "$(s_opt probe_now)" = "1" ]; then
+		uci -q set "$CFG.settings.probe_now=0"
+		uci -q commit "$CFG"
+		mode=$(s_opt mode); mode=${mode:-off}
+		if [ "$mode" = "on" ]; then
+			if probe_adh; then
+				st_set probe ok
+			else
+				st_set probe fail
+				st_set error "$(probe_reason)"
+			fi
+		fi
+		st_commit
+		return 0
+	fi
+
+	mode=$(s_opt mode); mode=${mode:-off}
+	eff=$(t_opt effective); eff=${eff:-off}
+	if [ "$mode" = "on" ]; then
+		# 已经 on 且参数没变，才什么都不做；参数变了必须重下发
+		if [ "$eff" = "on" ] && [ "$(sig_now)" = "$(t_opt applied_sig)" ]; then
+			return 0
+		fi
+		do_on
+		rc=$?
+		if [ "$rc" != "0" ]; then
+			# 没切成功就把意图退回，避免"页面写着用 ADH、实际是原生"的长期错位
+			uci -q set "$CFG.settings.mode=off"
+			uci -q commit "$CFG"
+			log "切换未成功（rc=$rc），mode 已回退为 off"
+		fi
+	else
+		[ "$eff" = "off" ] && return 0
+		do_off
+	fi
+	return 0
+}
+
+# ============================================================
+# status
+# ============================================================
+do_status() {
+	need_cfg
+	mode=$(s_opt mode); mode=${mode:-off}
+	eff=$(t_opt effective); eff=${eff:-off}
+	[ "$eff" = "off" ] && eff_desc="未启用（原生 DNS）" || {
+		[ "$eff" = "on" ] && eff_desc="使用 ADH" || eff_desc="已降级到运营商（failover）"
+	}
+	[ "$mode" = "on" ] && mode_desc="使用 ADH DNS" || mode_desc="原生 DNS"
+
+	echo "目标模式:    $mode    ($mode_desc)"
+	echo "实际生效:    $eff    ($eff_desc)"
+	if [ "$mode" = "on" ]; then
+		printf "ADH 探测:    "
+		if probe_adh; then echo "ok"; else echo "fail —— $(probe_reason)"; fi
+	fi
+	echo "ADH 地址:    $ADH:$ADH_PORT"
+	echo "主 DNS:      $ADH（AdGuardHome）"
+	echo "主 DNS v6:   $(detect_adh_v6 2>/dev/null || echo 未探测到)"
+	echo "备用 DNS v4: $FB  ($(fb_reach))"
+	echo "备用 DNS v6: ${FB6:-未配置}"
+	echo "上游来源:    $UPSTREAM_MODE$([ "$UPSTREAM_MODE" = manual ] && echo "（手动）" || echo "（跟随运营商）")"
+	echo "853 策略:    $DOT853"
+	echo "当前上游:    $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)"
+	echo "DHCP 下发:   $(uci -q get dhcp.lan.dhcp_option 2>/dev/null)"
+	conflict_scan
+	case "$CONFLICT_LEVEL" in
+		block)
+			echo "53 端口:     冲突 —— $CONFLICT_WHY"
+			echo "修复:        $CONFLICT_FIX"
+			;;
+		warn)
+			echo "53 端口:     可用，但有隐患 —— $CONFLICT_WHY"
+			echo "建议:        $CONFLICT_FIX"
+			;;
+		*)
+			echo "53 端口:     正常（dnsmasq 独占）"
+			;;
+	esac
+	if nft list chain inet fw4 dns_hijack >/dev/null 2>&1; then
+		n=$(grep -c 'ether saddr' "$NFT_FRAG" 2>/dev/null)
+		[ -n "$n" ] || n=0
+		echo "劫持链:      在位（ether 豁免: $n 条）"
+	else
+		echo "劫持链:      不存在"
+	fi
+	if [ "$DOT853" = "block" ]; then
+		if nft list chain inet fw4 dot_block >/dev/null 2>&1; then
+			echo "853(DoT):    拦截（策略=block）"
+		else
+			echo "853(DoT):    策略=block 但链不在（异常）"
+		fi
+	else
+		if nft list chain inet fw4 dot_block >/dev/null 2>&1; then
+			echo "853(DoT):    放行（策略=allow，但内核里还有残留链）"
+		else
+			echo "853(DoT):    放行（策略=allow）"
+		fi
+	fi
+	lc=$(t_opt last_change)
+	[ -n "$lc" ] && [ "$lc" != "0" ] && echo "最后切换:    $(date -d "@$lc" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$lc")"
+	[ -f "$ST_CHECK" ] && echo "最后检查:    $(date -d "@$(cat "$ST_CHECK")" '+%H:%M:%S' 2>/dev/null || cat "$ST_CHECK")"
+	err=$(t_opt error)
+	[ -n "$err" ] && echo "最近错误:    $err"
+	return 0
+}
+
+# ============================================================
+# main
+# ============================================================
+case "${1:-status}" in
+	on)
+		lock_take || { echo "另一个 dns-switch 正在执行"; exit 75; }
+		need_cfg
+		prev=$(s_opt mode); prev=${prev:-off}
+		uci -q set "$CFG.settings.mode=on"
+		uci -q commit "$CFG"
+		do_on
+		rc=$?
+		if [ "$rc" != "0" ]; then
+			# 闸门拒绝 / 回滚 都退回意图，避免"点了没反应，但哪天 ADH 一起来就自动开"
+			uci -q set "$CFG.settings.mode=$prev"
+			uci -q commit "$CFG"
+			log "切换未成功（rc=$rc），mode 已回退为 $prev"
+		fi
+		# rescue 会把守护停掉，这里负责把它拉回来
+		[ "$rc" = "0" ] && /etc/init.d/dns-switch start >/dev/null 2>&1
+		exit $rc
+		;;
+	off)
+		lock_take || { echo "另一个 dns-switch 正在执行"; exit 75; }
+		need_cfg
+		do_off
+		exit $?
+		;;
+	restore-original)
+		lock_take || { echo "另一个 dns-switch 正在执行"; exit 75; }
+		need_cfg
+		do_off
+		rc=$?
+		rm -rf "$BK"
+		log "已清除调试备份 $BK"
+		exit $rc
+		;;
+	rescue)
+		# 故意不加锁：daemon 可能正卡在 tick 里，逃生通道不能被锁挡住
+		do_rescue
+		exit $?
+		;;
+	snapshot)
+		shift
+		case "${1:-list}" in
+			save)
+				ts=$(snap_save) || { echo "保存失败"; exit 1; }
+				echo "已保存快照：$ts"
+				;;
+			restore)
+				[ -n "${2:-}" ] || { echo "用法：dns-switch snapshot restore <时间戳>"; exit 1; }
+				snap_restore "$2"
+				exit $?
+				;;
+			diff)
+				shift
+				snap_diff "${1:-}" "${2:-}"
+				exit $?
+				;;
+			*)
+				snap_list
+				;;
+		esac
+		;;
+	drill)
+		# 演练会驱动 tick，必须持锁；否则 daemon 正在 tick 时两边打架
+		lock_take || { echo "另一个 dns-switch 正在执行，稍后再试"; exit 75; }
+		LOG_TTY=1
+		do_drill
+		rc=$?
+		lock_drop
+		exit $rc
+		;;
+	bundle)
+		do_bundle
+		exit $?
+		;;
+	timeline)
+		do_timeline "${2:-20}"
+		;;
+	status)
+		do_status
+		;;
+	init)
+		lock_take || exit 0
+		do_init
+		;;
+	tick)
+		lock_take || exit 0
+		do_tick
+		;;
+	apply-intent)
+		lock_take || exit 0
+		do_apply_intent
+		;;
+	daemon)
+		if lock_take; then
+			do_init
+			lock_drop
+		fi
+		while :; do
+			if lock_take; then
+				do_tick
+				lock_drop
+			fi
+			sleep 55
+		done
+		;;
+	*)
+		grep '^#' "$0" | sed -n '3,30p' | sed 's/^# \{0,1\}//'
+		exit 1
+		;;
+esac
