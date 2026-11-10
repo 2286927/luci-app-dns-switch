@@ -1,0 +1,84 @@
+#!/bin/sh
+# /etc/uci-defaults/99-dns-switch
+#
+# 首次启动执行一次（成功后由 uci-defaults 机制自动删除），
+# 负责把 dns-switch 摆成「出厂默认态」：
+#   1. mode = off —— 路由器原生 DNS，刷完机就能上网，ADH 就绪后由页面点一下才切
+#   2. 补齐缺省参数（老配置升级上来时可能缺键）
+#   3. 清掉可能存在的劫持残留，保证首次开机不带任何 DNS 改写
+#   4. 三个运行时文件加入 sysupgrade 保留清单，升级不丢
+#   5. 启用并启动守护（mode=off 时它空转，但必须常驻，
+#      否则页面点「启用」时 procd 的 reload 触发器没有实例可触发）
+#
+# 全部操作幂等：手工重复执行不产生副作用。
+
+set -e
+
+[ -f /etc/config/dns_switch ] || exit 0
+[ -x /usr/bin/dns-switch ] || exit 0
+
+log() { logger -t dns-switch-factory "$*"; }
+
+# ── 1. 首次落地的默认开关 ─────────────────────────────────────
+# 已经有值就不动：sysupgrade 保留配置升级上来时，用户选过的 on 不能被抹掉
+if [ -z "$(uci -q get dns_switch.settings.mode)" ]; then
+	uci set dns_switch.settings.mode='off'
+	log '出厂默认 mode=off（路由器原生 DNS）'
+fi
+
+# ── 2. 补齐缺省值 ────────────────────────────────────────────
+# 只在缺键时写，不覆盖用户改过的值
+fill() {
+	[ -n "$(uci -q get "dns_switch.settings.$1")" ] || uci set "dns_switch.settings.$1=$2"
+}
+fill adh_ip          '172.16.1.2'
+fill adh_port        '3030'
+fill fallback_dns    '172.16.5.5'
+fill probe_domain    'www.baidu.com'
+fill auto_failover   '1'
+fill probe_now       '0'
+fill request_at      '0'
+fill dot853          'allow'
+fill upstream_mode   'auto'
+fill isp_list4       '202.103.224.68 202.103.225.68'
+
+# 空字符串也是合法值（表示"自动探测"/"不下发"），单独判存在性
+for k in fallback_dns6 isp_list6 adh_mac; do
+	uci -q get "dns_switch.settings.$k" >/dev/null 2>&1 || uci set "dns_switch.settings.$k="
+done
+
+uci -q commit dns_switch
+
+# ── 3. 出厂不带劫持残留 ──────────────────────────────────────
+# nft 规则只能由 dns-switch on 运行时生成。预置一份会让
+# 「默认 off」变成假象（规则在拦，dnsmasq 上游却没指 ADH）。
+if [ -f /etc/nftables.d/20-dns-hijack.nft ]; then
+	rm -f /etc/nftables.d/20-dns-hijack.nft
+	log '清除预置的劫持规则文件（应由 dns-switch on 生成）'
+fi
+
+# 快照与运行态目录，避免首次 on 时因目录缺失失败
+mkdir -p /etc/dns-switch/snapshots
+
+# ── 4. 升级保留清单 ─────────────────────────────────────────
+# 作为独立软件包，/usr/bin/dns-switch 和 /etc/init.d/dns-switch 由包管理器
+# 负责安装与升级，不需要写进 sysupgrade.conf（那是给"塞在 overlay 里的
+# 裸文件"用的）。/etc/config/ 本来就会被 sysupgrade 默认保留。
+# 这里只清理历史遗留的两条，避免老用户的 sysupgrade.conf 里留着指向
+# 早已不存在的脚本的条目。
+if [ -f /etc/sysupgrade.conf ]; then
+	if grep -qxF -e '/usr/bin/dns-failover.sh' -e '/usr/bin/dns-policy-check.sh' /etc/sysupgrade.conf; then
+		grep -vxF -e '/usr/bin/dns-failover.sh' -e '/usr/bin/dns-policy-check.sh' \
+			/etc/sysupgrade.conf > /tmp/sysupgrade.conf.$$ \
+			&& mv /tmp/sysupgrade.conf.$$ /etc/sysupgrade.conf
+	fi
+fi
+
+# ── 5. 启用守护 ─────────────────────────────────────────────
+# enable 会建 /etc/rc.d/S99dns-switch。首次开机时 rcS 可能已经
+# 枚举过启动列表，所以这里额外 start 一次（procd 幂等，重复启动只告警）。
+/etc/init.d/dns-switch enable >/dev/null 2>&1 || true
+/etc/init.d/dns-switch start  >/dev/null 2>&1 || true
+
+log "出厂初始化完成：mode=$(uci -q get dns_switch.settings.mode)"
+exit 0
