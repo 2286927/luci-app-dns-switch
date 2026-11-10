@@ -1,0 +1,11 @@
+{
+	"luci-app-dns-switch": {
+		"description": "DNS gateway switching: read and write the dns_switch configuration",
+		"read": {
+			"uci": [ "dns_switch" ]
+		},
+		"write": {
+			"uci": [ "dns_switch" ]
+		}
+	}
+}
