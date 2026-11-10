@@ -1,0 +1,10 @@
+{
+	"admin/services/dns-switch": {
+		"title": "DNS 网关切换",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "dns_switch/overview"
+		}
+	}
+}
