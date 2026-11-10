@@ -1,0 +1,8 @@
+# 一律 LF：这些文件会进 busybox ash，CRLF 会让 shell 报 unexpected word
+* text=auto eol=lf
+
+*.sh   text eol=lf
+Makefile text eol=lf
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
