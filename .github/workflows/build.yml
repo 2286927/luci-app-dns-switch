@@ -45,7 +45,11 @@ jobs:
         uses: openwrt/gh-action-sdk@main
         env:
           ARCH: ${{ matrix.sdk }}
-          FEEDNAME: dns-switch
+          # 不能带连字符。gh-action-sdk 会写 `src-link $FEEDNAME /feed/`，
+          # 而 OpenWrt 的 scripts/feeds 用 `\s+(\w+)` 取 feed 名——`\w` 不含 `-`，
+          # 写成 dns-switch 会让整行解析失败，报的却是 "Syntax error in feeds.conf"。
+          # 包名 luci-app-dns-switch 不受影响，那是 PACKAGES 而不是 feed 名。
+          FEEDNAME: dnsswitch
           PACKAGES: luci-app-dns-switch
 
       - name: Show artifacts
