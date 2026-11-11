@@ -5,7 +5,7 @@ name: build-apk-25.12
 # 为什么不用 gh-action-sdk：它只支持 23.05 / 24.10 的官方 SDK，出的是 ipk，
 # 而 R68S 跑的是 ImmortalWrt 25.12，包管理器是 apk，装不了 ipk。
 #
-# 这里改用 MD 仓 r68s 那条 25.12 线同一分支、同一 target 的 SDK
+# 这里用 MD 仓 r68s 那条 25.12 线同一分支、同一 target 的 SDK
 # （openwrt-25.12 · rockchip/armv8 · gcc-14.3.0_musl），工具链与固件一致。
 # 包本体是 shell + JS，PKGARCH=all，不涉及 ABI。
 
@@ -17,7 +17,6 @@ on:
         required: false
         default: 'https://downloads.immortalwrt.org/releases/25.12-SNAPSHOT/targets/rockchip/armv8/immortalwrt-sdk-25.12-SNAPSHOT-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst'
 
-  # 首次把本文件传上来就会自动跑一次；之后走手动触发，避免每次改文件都烧额度
   push:
     branches: [main]
     paths:
@@ -61,10 +60,12 @@ jobs:
           curl -fL --retry 3 --retry-delay 5 -o sdk.tar.zst "$SDK_URL"
           ls -lh sdk.tar.zst
           sudo apt-get update -qq
-          sudo apt-get install -y -qq zstd
+          sudo apt-get install -y -qq zstd rsync python3-pyelftools
           tar --zstd -xf sdk.tar.zst
           ls -d immortalwrt-sdk-*
 
+      # 只装必要的几个：装 -a 会把 uboot/perl 一起拉进来，
+      # 触发 python3-pyelftools / rsync 前置检查失败（第一次就是这么挂的）。
       - name: 编译 luci-app-dns-switch
         run: |
           set -euo pipefail
@@ -72,33 +73,42 @@ jobs:
           cd "$SDK"
           # feed 名不能带连字符：scripts/feeds 用 \s+(\w+) 取名字，\w 不含 '-'
           echo "src-link dnsswitch $GITHUB_WORKSPACE" >> feeds.conf.default
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ./scripts/feeds update luci packages dnsswitch
+          ./scripts/feeds install luci-base nftables luci-app-dns-switch
           make defconfig
           make package/luci-app-dns-switch/compile V=s -j"$(nproc)" || {
             echo '::error::编译失败，见上方日志'; exit 1;
           }
           echo '--- 产物 ---'
           find bin/packages -type f -name '*.apk' | sort
-          find bin/packages -type f -name '*.ipk' | sort || true
 
-      - name: 校验包元数据
+      - name: 校验包元数据并转 base64
         run: |
           set -euo pipefail
           SDK="$(ls -d immortalwrt-sdk-*)"
           PKG="$(find "$SDK/bin/packages" -type f -name 'luci-app-dns-switch*.apk' | head -1)"
           [ -n "$PKG" ] || { echo '::error::没找到 apk 产物'; exit 1; }
-          echo "PKG=$PKG"
+          echo "APK_FILE=$PKG"
           ls -lh "$PKG"
-          mkdir -p /tmp/apkx && tar -xf "$PKG" -C /tmp/apkx 2>/dev/null || true
-          ls -la /tmp/apkx | head -20
-          for f in .PKGINFO .SIGN.RSA; do
-            [ -f "/tmp/apkx/$f" ] && { echo "--- $f ---"; head -30 "/tmp/apkx/$f"; }
-          done
+          sha256sum "$PKG"
+          rm -rf /tmp/apkx && mkdir -p /tmp/apkx
+          tar -xf "$PKG" -C /tmp/apkx 2>/dev/null || true
+          echo '--- 包内文件 ---'
+          find /tmp/apkx -type f | sort | head -30
+          if [ -f /tmp/apkx/.PKGINFO ]; then echo '--- .PKGINFO ---'; cat /tmp/apkx/.PKGINFO; fi
+          if [ -f /tmp/apkx/.post-install ]; then echo '--- .post-install ---'; cat /tmp/apkx/.post-install; fi
+          if [ -f /tmp/apkx/.pre-deinstall ]; then echo '--- .pre-deinstall ---'; cat /tmp/apkx/.pre-deinstall; fi
+          # artifact 配额满了（本仓 2026-11-11 已触发 quota），日志兜底：
+          echo '-----BEGIN-APK-BASE64-----'
+          base64 -w0 "$PKG"
+          echo
+          echo '-----END-APK-BASE64-----'
 
+      # 配额已满时这里必然失败，不让它红掉整个 job
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: luci-app-dns-switch-apk-25.12
           path: immortalwrt-sdk-*/bin/packages/**/*.apk
-          if-no-files-found: error
-          retention-days: 14
+          if-no-files-found: warn
+          retention-days: 7
