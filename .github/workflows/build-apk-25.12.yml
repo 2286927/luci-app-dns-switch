@@ -66,6 +66,9 @@ jobs:
 
       # 只装必要的几个：装 -a 会把 uboot/perl 一起拉进来，
       # 触发 python3-pyelftools / rsync 前置检查失败（第一次就是这么挂的）。
+      #
+      # 必须走"选中包 + 整体 make"：直接 make package/X/compile 不排序依赖，
+      # 会让 lucihttp 先于 lua 编译，报 lua.h not found（第二次挂在这）。
       - name: 编译 luci-app-dns-switch
         run: |
           set -euo pipefail
@@ -75,8 +78,10 @@ jobs:
           echo "src-link dnsswitch $GITHUB_WORKSPACE" >> feeds.conf.default
           ./scripts/feeds update luci packages dnsswitch
           ./scripts/feeds install luci-base nftables luci-app-dns-switch
+          echo 'CONFIG_PACKAGE_luci-app-dns-switch=y' >> .config
           make defconfig
-          make package/luci-app-dns-switch/compile V=s -j"$(nproc)" || {
+          grep -E 'CONFIG_PACKAGE_luci-app-dns-switch=' .config || true
+          make -j"$(nproc)" || {
             echo '::error::编译失败，见上方日志'; exit 1;
           }
           echo '--- 产物 ---'
