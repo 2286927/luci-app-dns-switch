@@ -1,0 +1,104 @@
+name: build-apk-25.12
+
+# 目的：产出 25.12（apk-tools 3.x）能直接装上的 .apk。
+#
+# 为什么不用 gh-action-sdk：它只支持 23.05 / 24.10 的官方 SDK，出的是 ipk，
+# 而 R68S 跑的是 ImmortalWrt 25.12，包管理器是 apk，装不了 ipk。
+#
+# 这里改用 MD 仓 r68s 那条 25.12 线同一分支、同一 target 的 SDK
+# （openwrt-25.12 · rockchip/armv8 · gcc-14.3.0_musl），工具链与固件一致。
+# 包本体是 shell + JS，PKGARCH=all，不涉及 ABI。
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_url:
+        description: 'SDK 地址（默认 25.12 rockchip/armv8）'
+        required: false
+        default: 'https://downloads.immortalwrt.org/releases/25.12-SNAPSHOT/targets/rockchip/armv8/immortalwrt-sdk-25.12-SNAPSHOT-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst'
+
+  # 首次把本文件传上来就会自动跑一次；之后走手动触发，避免每次改文件都烧额度
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-apk-25.12.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # GitHub 网页上传统一按 644 存，脚本进仓库就丢执行位；
+      # luci.mk 打包用 cp -p，644 会原样进包 —— 装上去 dns-switch 跑不起来。
+      - name: 恢复执行位
+        run: |
+          set -e
+          chmod +x luci-app-dns-switch/root/usr/bin/dns-switch
+          chmod +x luci-app-dns-switch/root/etc/init.d/dns-switch
+          chmod +x luci-app-dns-switch/root/etc/uci-defaults/99-dns-switch
+          chmod +x check.sh
+          ls -l luci-app-dns-switch/root/usr/bin/dns-switch
+
+      - name: 结构自检
+        run: bash check.sh
+
+      - name: 下载并解开 SDK
+        run: |
+          set -euo pipefail
+          SDK_URL="${{ inputs.sdk_url }}"
+          if [ -z "$SDK_URL" ]; then
+            SDK_URL="https://downloads.immortalwrt.org/releases/25.12-SNAPSHOT/targets/rockchip/armv8/immortalwrt-sdk-25.12-SNAPSHOT-rockchip-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+          fi
+          echo "SDK=$SDK_URL"
+          curl -fL --retry 3 --retry-delay 5 -o sdk.tar.zst "$SDK_URL"
+          ls -lh sdk.tar.zst
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd
+          tar --zstd -xf sdk.tar.zst
+          ls -d immortalwrt-sdk-*
+
+      - name: 编译 luci-app-dns-switch
+        run: |
+          set -euo pipefail
+          SDK="$(ls -d immortalwrt-sdk-*)"
+          cd "$SDK"
+          # feed 名不能带连字符：scripts/feeds 用 \s+(\w+) 取名字，\w 不含 '-'
+          echo "src-link dnsswitch $GITHUB_WORKSPACE" >> feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/luci-app-dns-switch/compile V=s -j"$(nproc)" || {
+            echo '::error::编译失败，见上方日志'; exit 1;
+          }
+          echo '--- 产物 ---'
+          find bin/packages -type f -name '*.apk' | sort
+          find bin/packages -type f -name '*.ipk' | sort || true
+
+      - name: 校验包元数据
+        run: |
+          set -euo pipefail
+          SDK="$(ls -d immortalwrt-sdk-*)"
+          PKG="$(find "$SDK/bin/packages" -type f -name 'luci-app-dns-switch*.apk' | head -1)"
+          [ -n "$PKG" ] || { echo '::error::没找到 apk 产物'; exit 1; }
+          echo "PKG=$PKG"
+          ls -lh "$PKG"
+          mkdir -p /tmp/apkx && tar -xf "$PKG" -C /tmp/apkx 2>/dev/null || true
+          ls -la /tmp/apkx | head -20
+          for f in .PKGINFO .SIGN.RSA; do
+            [ -f "/tmp/apkx/$f" ] && { echo "--- $f ---"; head -30 "/tmp/apkx/$f"; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-dns-switch-apk-25.12
+          path: immortalwrt-sdk-*/bin/packages/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
