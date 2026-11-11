@@ -113,6 +113,18 @@ luci-app-dns-switch/
 
 设备上**没有 `diff`**（busybox 未必编译），快照比对用的是 `cmp` + `awk`。
 
+### 本地构建前请补执行位
+
+仓库里的脚本可能带着 644（GitHub 网页上传不保留 mode）。打包用的是 `cp -p`，644 会原样进包，装到设备上 `dns-switch` 会跑不起来。
+
+```sh
+chmod +x luci-app-dns-switch/root/usr/bin/dns-switch \
+         luci-app-dns-switch/root/etc/init.d/dns-switch \
+         luci-app-dns-switch/root/etc/uci-defaults/99-dns-switch
+```
+
+CI 里这一步是自动的；本地构建、zip 下载、fork 之后都需要手动补一次。`bash check.sh` 会把这条查出来。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。

@@ -1,12 +1,10 @@
-# 构建产物
-bin/
-build_dir/
-staging_dir/
-tmp/
+/bin/
+/build_dir/
+/staging_dir/
+/tmp/
 *.ipk
 *.apk
 
-# 编辑器
 .vscode/
 .idea/
 *.swp
