@@ -26,6 +26,18 @@ jobs:
         with:
           fetch-depth: 1
 
+      # GitHub 网页上传统一按 644 存，脚本进仓库就丢了执行位。
+      # luci.mk 打包用的是 cp -p，644 会原样进包——装到设备上 dns-switch
+      # 跑不起来、init 脚本不执行，属于「打包成功但装上就废」。
+      # 在构建前补回来，比依赖 git 的 mode 位可靠：zip 下载、fork、
+      # 别人本地 clone 出来的都是 644，只有这一步能兜住。
+      - name: Restore executable bits
+        run: |
+          chmod +x luci-app-dns-switch/root/usr/bin/dns-switch
+          chmod +x luci-app-dns-switch/root/etc/init.d/dns-switch
+          chmod +x luci-app-dns-switch/root/etc/uci-defaults/99-dns-switch
+          ls -l luci-app-dns-switch/root/usr/bin/dns-switch luci-app-dns-switch/root/etc/init.d/dns-switch
+
       - name: Package structure check
         run: bash check.sh
 
