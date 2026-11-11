@@ -77,10 +77,12 @@ jobs:
           # feed 名不能带连字符：scripts/feeds 用 \s+(\w+) 取名字，\w 不含 '-'
           echo "src-link dnsswitch $GITHUB_WORKSPACE" >> feeds.conf.default
           ./scripts/feeds update luci packages dnsswitch
-          ./scripts/feeds install luci-base nftables luci-app-dns-switch
+          # lua 必须显式装：feeds install 只链接点名的包、不拉依赖，
+          # 少了它 luci-base/lucihttp 的 lua/host 构建依赖会缺，报 lua.h not found
+          ./scripts/feeds install lua luci-base nftables luci-app-dns-switch
           echo 'CONFIG_PACKAGE_luci-app-dns-switch=y' >> .config
           make defconfig
-          grep -E 'CONFIG_PACKAGE_luci-app-dns-switch=' .config || true
+          grep -E 'CONFIG_PACKAGE_(luci-app-dns-switch|lua)=' .config || true
           make -j"$(nproc)" || {
             echo '::error::编译失败，见上方日志'; exit 1;
           }
