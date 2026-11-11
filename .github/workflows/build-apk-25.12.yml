@@ -76,9 +76,10 @@ jobs:
           cd "$SDK"
           # feed 名不能带连字符：scripts/feeds 用 \s+(\w+) 取名字，\w 不含 '-'
           echo "src-link dnsswitch $GITHUB_WORKSPACE" >> feeds.conf.default
-          ./scripts/feeds update luci packages dnsswitch
-          # lua 必须显式装：feeds install 只链接点名的包、不拉依赖，
-          # 少了它 luci-base/lucihttp 的 lua/host 构建依赖会缺，报 lua.h not found
+          # 必须 update -a：只更新部分 feed 会让 base/routing/telephony 的索引缺失，
+          # libubox/libubus/liblua 就全被当成"不存在"，lucihttp 编译必挂。
+          # 但 install 只点名装需要的几个 —— install -a 会把 uboot/perl 也选进来。
+          ./scripts/feeds update -a
           ./scripts/feeds install lua luci-base nftables luci-app-dns-switch
           echo 'CONFIG_PACKAGE_luci-app-dns-switch=y' >> .config
           make defconfig
