@@ -1,8 +1,11 @@
 {
 	"luci-app-dns-switch": {
-		"description": "DNS gateway switching: read and write the dns_switch configuration",
+		"description": "DNS gateway switching: read and write the dns_switch configuration, and stat /usr/bin/curl to show (or hide) the missing-dependency hint",
 		"read": {
-			"uci": [ "dns_switch" ]
+			"uci": [ "dns_switch" ],
+			"file": {
+				"/usr/bin/curl": [ "read" ]
+			}
 		},
 		"write": {
 			"uci": [ "dns_switch" ]
