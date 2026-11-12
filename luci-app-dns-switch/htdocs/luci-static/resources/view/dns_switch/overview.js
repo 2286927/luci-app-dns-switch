@@ -4,6 +4,7 @@
 'require uci';
 'require ui';
 'require poll';
+'require fs';
 
 function ts(v) {
 	var n = parseInt(v || '0', 10);
@@ -57,8 +58,32 @@ return view.extend({
 				conflict: g('status', 'conflict') || 'none',
 				conflictBy: g('status', 'conflict_by'),
 				conflictMsg: g('status', 'conflict_msg'),
-				conflictFix: g('status', 'conflict_fix')
+				conflictFix: g('status', 'conflict_fix'),
+				// 探测依赖：留空/未知一律当正常（不打扰）；
+				// 只有守护进程明确写了 no-curl 才提示。
+				dep: g('status', 'dep')
 			};
+		}).then(function(st) {
+			// dep 由守护每轮 tick（55 秒）写一次；下面这段是页面侧的加速：
+			// 直接看一眼二进制，命中就原地翻案，刷新即可看到提示消失，
+			// 甚至不刷新也会在下一轮 poll（5 秒）翻案。
+			//
+			// 用 fs.stat 而不是 fs.access：本版 LuCI（25.12）的 fs.js 只有
+			// exec/list/read/stat，**没有 access**。两者语义一致（成功 resolve
+			// / 失败 reject），换成 stat 后这段在本版才真正执行，ACL 里那条
+			// /usr/bin/curl 只读授权也随之从空转变成用得上。
+			//
+			// 无论走不走得到，都必须"只有确证存在才翻案"：查不到（ACL 未授权、
+			// ubus 不可用、非标准路径）就保留守护的结论，绝不把页面搞崩。
+			if (st.dep !== 'no-curl' || typeof fs.stat !== 'function')
+				return st;
+			return fs.stat('/usr/bin/curl').then(function(r) {
+				if (r !== false)
+					st.dep = 'ok';
+				return st;
+			}, function() {
+				return st;
+			});
 		});
 	},
 
@@ -114,6 +139,28 @@ return view.extend({
 		}, rows);
 	},
 
+	// 缺 curl 不是故障，只是探测精度降了一档：装不装都能正常切换，
+	// 所以不弹窗、不拦按钮，只在卡片里放一条会自己消失的提示。
+	// curl 是独立包，luci-base 不拉它，精简固件上很常见——这也是有意
+	// 不把它写进依赖的原因（为了一个探测端口让整个包多拖 libcurl4，不划算）。
+	depNote: function() {
+		return E('div', {
+			'style': 'margin-top:.9em;padding:.8em 1em;border-radius:4px;' +
+				'background:rgba(220,150,40,.10);border:1px solid rgba(220,150,40,.32)'
+		}, [
+			E('div', { 'style': 'font-size:.92em;line-height:1.6' },
+				_('未检测到 curl：探测精度降低')),
+			E('div', {
+				'style': 'margin-top:.35em;font-size:.85em;line-height:1.55;color:var(--text-color-medium)'
+			}, _('现在只按 DNS 解析判断 AdGuardHome 是否可用，切换和自动降级都照常工作。装上 curl 后刷新页面即会消失，最迟约一分钟内也会自动消失，不用重启服务，也不用重启设备。')),
+			E('div', {
+				'style': 'margin-top:.7em;padding:.6em .8em;border-radius:4px;' +
+					'background:rgba(128,128,128,.16);font-family:monospace;font-size:.82em;' +
+					'line-height:1.6;white-space:pre-wrap;word-break:break-all;user-select:all'
+			}, 'apk add curl          # 25.12 及以后\nopkg install curl     # 23.05 / 24.10')
+		]);
+	},
+
 	card: function(st) {
 		var h = this.headline(st);
 		var rows = [
@@ -133,6 +180,9 @@ return view.extend({
 			rows.push(E('div', {
 				'style': 'margin-top:.6em;font-size:.9em;color:var(--error-color-high)'
 			}, st.error));
+
+		if (st.dep === 'no-curl')
+			rows.push(this.depNote());
 
 		var on = (st.mode === 'on');
 
@@ -165,8 +215,10 @@ return view.extend({
 		var lastKey = null;
 
 		var paint = function(st) {
+			// dep 必须进 key：漏了它，状态里的 dep 变了但 key 不变，paint 直接
+			// return，缺 curl 的提示就永远是「画上去就再也下不来」。
 			var key = JSON.stringify([st.mode, st.effective, st.probe, st.changed,
-				st.error, st.conflict, st.conflictMsg, st.conflictFix]);
+				st.error, st.conflict, st.conflictMsg, st.conflictFix, st.dep]);
 			if (key === lastKey)
 				return;
 			lastKey = key;
