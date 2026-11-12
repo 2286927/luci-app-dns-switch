@@ -34,6 +34,21 @@ make package/luci-app-dns-switch/compile V=s
 
 产物在 `bin/packages/<arch>/dns-switch/luci-app-dns-switch_*.ipk`。
 
+### 编译细节
+
+**本地仓库直接编**（改完就想看效果，不想先 push）：`feeds.conf.default` 里用 `src-link` 指向本地目录即可，`feeds update` 会直接读工作区。
+
+```sh
+echo "src-link dns-switch /path/to/luci-app-dns-switch" >> feeds.conf.default
+./scripts/feeds update dns-switch && ./scripts/feeds install luci-app-dns-switch
+make menuconfig            # LuCI → Applications → luci-app-dns-switch（按 M 或 *）
+make package/luci-app-dns-switch/compile V=s
+```
+
+- **架构无关**：Makefile 里写的是 `LUCI_PKGARCH:=all`。这个包只有 shell 脚本、JS 页面、JSON 配置和 nft 片段，没有一行要编译的代码，所以**一个包能装在所有架构上**（mipsel / aarch64 / x86_64 通用），不用给每种设备各编一份。
+- **依赖只有两个**：`LUCI_DEPENDS:=+luci-base +nftables`。`luci-base` 提供页面框架和 uci/rpcd 接口，`nftables` 提供 `nft` 与 `fw4`。**故意不依赖 `curl`**：缺它只让探测降一档精度（页面会提示），加进依赖会让精简固件白白多拖一个 `libcurl4`。
+- `make package/luci-app-dns-switch/compile V=s` 只编这一个包，通常几十秒；`V=s` 是出问题时唯一能看清原因的开关。
+
 ### 方式二：直接安装预编译包
 
 到 [Releases](../../releases) 下载对应架构的包，然后：
@@ -70,10 +85,30 @@ dns-switch snapshot restore X  # 回滚到某个快照
 
 它救不了接口层故障（netifd 卡死、`ip` 命令挂住）。那种情况它不会假装成功，会明确告诉你去看网络层。
 
-## 前置条件
+## 装完先改这三项
 
+出厂默认是照着作者的网段写的（`172.16.1.0/24`）。换成你自己的网络，只要改这三项——都在「高级参数」里，改完点**保存参数**：
+
+| 改哪 | 出厂值 | 说明 |
+|---|---|---|
+| AdGuardHome 地址 | `172.16.1.2` | 跑着 ADH 那台设备在**你家局域网里**的 IPv4。填错的表现是切换被拒绝（探测不过），而不是网络断掉 |
+| 管理端口 | `3030` | ADH 的**网页/管理**端口（不是 53）。用来确认 ADH 进程真的活着，不只看 53 通不通 |
+| 备用 DNS IPv4 | `172.16.5.5` | ADH 不可用时，DHCP 直接下发给客户端兜底的地址。填你的上游 DNS（运营商或公共 DNS 都行）；留空表示只下发路由器自己 |
+
+另外两个按需：**备用 DNS IPv6**（留空不下发，避免客户端拿到不可达的 v6 DNS 拖慢解析）、**AdGuardHome 网卡 MAC**（留空自动探测，换设备后填上，用于放行 ADH 自己的出站查询）。
+
+改完不用重启：守护每 55 秒重读一次配置，下一次对账就用新值下发。想立刻验证，`dns-switch on` 一次即可。
+
+## 适用前提
+
+- **固件带 fw4 / nftables**，也就是 OpenWrt / ImmortalWrt **22.03 及以后**。fw3（iptables）时代的老固件**不支持**——本插件的劫持、853 策略全靠 nft 链，fw3 上装上去只会「看着成功、其实不生效」。
+- **busybox 要带 `flock` applet**。并发锁靠 `flock -n`，缺了它多处同时执行（页面点击 + 守护 tick）就没法互斥。官方固件默认带；自己裁过 busybox 的固件请确认 `busybox --list | grep flock` 有输出。
+- **强烈建议装 `curl`**。它只用来探 ADH 的 Web 端口（见「管理端口」那一项），属于精度增强而非硬依赖：缺了它探测降级为只做 DNS 解析验证，切换和自动降级照常工作，主卡片里会显示一条提示，装完自动消失。因此本包**没有**把 `curl` 写进依赖——为了一个探测端口让每个固件都多拖一个 `libcurl4`，不划算。
+  ```sh
+  apk add curl           # 25.12 及以后
+  opkg install curl      # 23.05 / 24.10
+  ```
 - 一台跑着 AdGuardHome 的设备（本插件只管「指过去」，不管「跑起来」）
-- 固件带 `nftables`（fw4 的固件都有）
 - 53 端口归 dnsmasq（如果被本机 AdGuardHome 之类的插件占了，插件会报出来并给出修复命令）
 
 ## 兼容性
