@@ -62,16 +62,33 @@ TL_KEEP_DAYS=7        # 时间线保留天数
 s_opt() { uci -q get "$CFG.settings.$1" 2>/dev/null; }
 t_opt() { uci -q get "$CFG.status.$1" 2>/dev/null; }
 
-ADH=$(s_opt adh_ip);           ADH=${ADH:-172.16.1.2}
-ADH_PORT=$(s_opt adh_port);    ADH_PORT=${ADH_PORT:-3030}
-FB=$(s_opt fallback_dns);      FB=${FB:-172.16.5.5}
-FB6=$(s_opt fallback_dns6)                     # IPv6 备用，走 RDNSS，空=不下发
-PROBE_DOMAIN=$(s_opt probe_domain); PROBE_DOMAIN=${PROBE_DOMAIN:-www.baidu.com}
+# 把关键参数读进全局变量。
+#
+# 为什么必须是一个函数、而不是启动时读一次：
+# daemon 是 `while :; do do_tick; sleep 55; done` 的常驻进程。只在进程启动
+# 时读配置的话，用户在页面上改完参数，之后每一轮 tick 的漂移重建 / 降级 /
+# 回切 仍然拿旧值重新下发——更要命的是 applied_sig（sig_now）记的也是旧值，
+# 签名比对认为"已应用"，于是永远不自纠。表现为：改了备用 DNS，页面保存成功，
+# 一旦发生自愈又被写回老值（2026-11 真机复现）。
+#
+# 约束：daemon 里会被反复调用，所以不许有任何副作用——不 commit、不写状态
+# 文件、不打日志。只做 uci 读。
+reload_cfg() {
+	ADH=$(s_opt adh_ip);           ADH=${ADH:-172.16.1.2}
+	ADH_PORT=$(s_opt adh_port);    ADH_PORT=${ADH_PORT:-3030}
+	FB=$(s_opt fallback_dns);      FB=${FB:-172.16.5.5}
+	FB6=$(s_opt fallback_dns6)                     # IPv6 备用，走 RDNSS，空=不下发
+	PROBE_DOMAIN=$(s_opt probe_domain); PROBE_DOMAIN=${PROBE_DOMAIN:-www.baidu.com}
 
-# 可配置项（每家的网络结构不一样，别写死）
-MAC_CFG=$(s_opt adh_mac)                       # 手填 MAC，空=自动探测
-DOT853=$(s_opt dot853);        DOT853=${DOT853:-allow}   # allow | block
-UPSTREAM_MODE=$(s_opt upstream_mode); UPSTREAM_MODE=${UPSTREAM_MODE:-auto}  # auto | manual
+	# 可配置项（每家的网络结构不一样，别写死）
+	MAC_CFG=$(s_opt adh_mac)                       # 手填 MAC，空=自动探测
+	DOT853=$(s_opt dot853);        DOT853=${DOT853:-allow}   # allow | block
+	UPSTREAM_MODE=$(s_opt upstream_mode); UPSTREAM_MODE=${UPSTREAM_MODE:-auto}  # auto | manual
+	return 0
+}
+
+# 进程启动先读一次，保持"直接跑 dns-switch on/off/status"的原有行为
+reload_cfg
 
 LAN_IP() {
 	ip=$(uci -q get network.lan.ipaddr 2>/dev/null)
@@ -151,6 +168,7 @@ config status 'status'
 	option effective 'off'
 	option probe 'unknown'
 	option reason 'factory-default'
+	option dep ''
 	option adh_mac ''
 	option upstream ''
 	option last_change '0'
@@ -198,9 +216,35 @@ isp_dns() {
 }
 
 # ---------- 探测 ----------
+# curl 是独立包（依赖 libcurl4），luci-base 不会拉它，精简固件上经常没有。
+# 它只用来探 ADH 的 Web 端口，属于"精度增强"，不是硬依赖：
+# 缺了它不能让探活恒失败——那会把好端端的 ADH 判成不可用，闸门永远拒绝切换。
+#
+# ⚠ 不能用 `command -v curl` 一句了事：busybox ash 会缓存命令查找结果。
+# daemon 是「同一个 shell 里每轮都跑一次 curl」的进程，hash 里永远有
+# /usr/bin/curl；用户 apk del / mv 掉 curl 之后，command -v 仍然返回那个
+# 路径（rc=0），只有真正 exec 时才 127。后果是：页面/新 SSH 会话说
+# "no-curl"，守护却以为有 curl → 探活恒失败 → 连续 2 次后 tier_failover
+# → 全屋降级。这是 F6 要消灭的灾难路径换了个入口，2026-11 真机抓到。
+#
+# 所以判定必须落到「文件此刻真的可执行」上：拿到路径后再 -x 兜底。
+have_curl() {
+	_curl_bin=$(command -v curl 2>/dev/null)
+	[ -n "$_curl_bin" ] || return 1
+	[ -x "$_curl_bin" ] || return 1
+	return 0
+}
+
+# 纯 DNS 探测：缺 curl（或 curl 实际跑不起来）时的降级路径。
+# ADH 的过滤/上游坏掉照样能发现，只是不能提前发现"Web 端口挂了但 53 还活着"。
+probe_dns_only() {
+	nslookup "$PROBE_DOMAIN" "$ADH" >/dev/null 2>&1
+}
+
 # 必须双条件：只测 53 会被"exchange 模式下 dnsmasq 从 1745 顶上来"骗过
 probe_adh() {
-	# 演练钩子：文件在有效期内就当作 ADH 失联
+	# 演练钩子优先级最高：文件在有效期内就当作 ADH 失联。
+	# 降级路径绝不能绕过它，否则 drill 会假装成功。
 	if [ -f "$PROBE_FAIL_FLAG" ]; then
 		age=$(( $(date +%s) - $(cat "$PROBE_FAIL_FLAG" 2>/dev/null || echo 0) ))
 		if [ "$age" -lt "$PROBE_FAIL_TTL" ]; then
@@ -210,20 +254,52 @@ probe_adh() {
 		rm -f "$PROBE_FAIL_FLAG"
 		log "演练标记已过期（${age}s），自动清除"
 	fi
+	# 没装 curl：退化成纯 DNS 探测
+	if ! have_curl; then
+		probe_dns_only && return 0
+		return 1
+	fi
 	code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$ADH:$ADH_PORT/" 2>/dev/null)
+	crc=$?
+	# 兜底：-x 检查通过、exec 却是 127（ash 的 hash 指向一个已被删掉的路径，
+	# 或者二进制在检查与执行之间被删）。这绝不能算 ADH 挂了，退回 DNS 探测。
+	if [ "$crc" = "127" ]; then
+		log "curl 无法执行（rc=127），本次退回仅 DNS 探测"
+		probe_dns_only && return 0
+		return 1
+	fi
 	[ -n "$code" ] || return 1
 	[ "$code" != "000" ] || return 1
-	nslookup "$PROBE_DOMAIN" "$ADH" >/dev/null 2>&1 || return 1
+	probe_dns_only || return 1
 	return 0
 }
 
+# 缺 curl（含"有路径但跑不起来"）时的归因文案：只描述 DNS 探测结果，
+# 不猜 Web 端口——猜错会把人引去重启 ADH，或者去查一个根本没在用的端口。
+probe_reason_nocurl() {
+	if probe_dns_only; then
+		echo "未安装 curl，仅按 DNS 探测（$PROBE_DOMAIN 解析正常）"
+	else
+		echo "未安装 curl，仅按 DNS 探测（$PROBE_DOMAIN 解析失败）"
+	fi
+}
+
 probe_reason() {
+	if ! have_curl; then
+		probe_reason_nocurl
+		return
+	fi
 	code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://$ADH:$ADH_PORT/" 2>/dev/null)
+	crc=$?
+	if [ "$crc" = "127" ]; then
+		probe_reason_nocurl
+		return
+	fi
 	if [ -z "$code" ] || [ "$code" = "000" ]; then
 		echo "Web $ADH_PORT 不通（AdGuardHome 未运行或地址不对）"
 		return
 	fi
-	if ! nslookup "$PROBE_DOMAIN" "$ADH" >/dev/null 2>&1; then
+	if ! probe_dns_only; then
 		echo "Web 有响应但解析失败（ADH 上游不可用）"
 		return
 	fi
@@ -661,6 +737,24 @@ do_rescue() {
 
 	# 1. 先让 daemon 别再把它改回去（失败也无所谓，下一步照样做）
 	uci -q set dns_switch.settings.mode='off' 2>/dev/null
+	# 事实状态也要跟着复位：守护马上会被停掉，没有 tick 会来纠正它。
+	# 不写这一笔，页面 headline() 会优先读 effective=on 亮绿灯说"全屋正在
+	# 使用 AdGuardHome"，而实际已回到运营商——急救场景里最不该出现的结论。
+	# probe / error / adh_mac 一起清掉，否则页面会留着"ADH 不可达"的旧红字。
+	# 这里刻意用 uci 直写而不是 st_set()：rescue 的定位是"本文件别的部分
+	# 有 bug 时它还能跑"，少依赖一层函数就少一个失败点。
+	# 和 mode 塞进同一次 commit：少一次写 flash；也避免"mode 已 off、effective
+	# 还 on"的中间态——后面还隔着 nft delete / fw4 reload / dnsmasq restart /
+	# sleep 2 一大段，rescue 又常在系统已经很不正常时执行，中途被打断的概率
+	# 比平时高，留一个窗口等于没修干净。
+	# 放在第 1 步而不是验证分支里：成功/失败两个分支都在它之后，天然全覆盖。
+	# 失败分支（解析仍不通）也必须是 off —— DNS 确实已经不在 ADH 上了，页面
+	# 说"正在使用运营商 DNS"才是事实，否则用户看到"还在用 ADH"就不再往下查了。
+	uci -q set dns_switch.status.effective='off' 2>/dev/null
+	uci -q set dns_switch.status.reason='factory-default' 2>/dev/null
+	uci -q set dns_switch.status.probe='unknown' 2>/dev/null
+	uci -q delete dns_switch.status.error 2>/dev/null
+	uci -q delete dns_switch.status.adh_mac 2>/dev/null
 	uci -q commit dns_switch 2>/dev/null
 	/etc/init.d/dns-switch stop 2>/dev/null
 
@@ -763,6 +857,47 @@ snap_list() {
 	done
 }
 
+# 把快照里的 settings 段还原回 uci。
+#
+# 为什么必须有：snap_save 存了 `uci show dns_switch`，但 snap_restore 原先
+# 只还原 dhcp / nft / mode，然后用**当前**参数跑 do_on——于是「改坏参数后
+# 回滚」是假的：option6 又被当前那套坏参数覆盖一遍，用户以为回滚成功了。
+#
+# 只还原 settings：status 是运行态（effective / error / last_change），
+# 写回去等于用旧事实覆盖当前事实，页面会显示一个根本不存在的故障。
+#
+# uci show 的形态是 `dns_switch.settings.key='value'`，list 则写成
+# `'a' 'b'`。这里剥掉外层引号，再把 `' '` 合回空格分隔（dns_switch.settings
+# 里没有真正的 list，但用户手工改过的配置可能有，顺手兼容一下）。
+# 用 sed 解析而不是 `uci import`：uci show 的输出不是 /etc/config 格式，
+# import 不认；而且 import 会把整个包（含 status 段）一起灌进来。
+snap_apply_settings() {
+	f="$1"
+	[ -f "$f" ] || return 1
+	tmp=/tmp/dns-switch.snapshot-settings
+	sed -n "s/^\(dns_switch\.settings\.[A-Za-z0-9_]*\)='\(.*\)'\$/\1 \2/p" "$f" > "$tmp" 2>/dev/null || {
+		rm -f "$tmp"
+		return 1
+	}
+	if [ ! -s "$tmp" ]; then
+		rm -f "$tmp"
+		return 1
+	fi
+	sn_n=0
+	while read -r sn_key sn_val; do
+		[ -n "$sn_key" ] || continue
+		case "$sn_val" in
+			*"'"*) sn_val=$(printf '%s' "$sn_val" | sed "s/' '/ /g") ;;
+		esac
+		uci -q set "$sn_key=$sn_val" || continue
+		sn_n=$((sn_n + 1))
+	done < "$tmp"
+	rm -f "$tmp"
+	[ "$sn_n" -gt 0 ] || return 1
+	uci -q commit dns_switch 2>/dev/null
+	return 0
+}
+
 snap_restore() {
 	d="$SNAPDIR/$1"
 	[ -d "$d" ] || { echo "没有这个快照：$1"; echo "用 dns-switch snapshot 看现有列表"; return 1; }
@@ -779,6 +914,16 @@ snap_restore() {
 			uci -q commit dns_switch 2>/dev/null
 		fi
 	fi
+
+	# settings 一起还原：参数不改回去，下面的 do_on 会用当前（可能正是要
+	# 逃离的那套）参数重新下发一遍，回滚就成了摆设。
+	if snap_apply_settings "$d/dns_switch.uci"; then
+		log "快照 $1 的 settings 已还原"
+	else
+		log "快照 $1 缺 dns_switch.uci，settings 未还原（按当前参数下发）"
+	fi
+	# 变量里还是旧值，重新读一遍，让下面的 do_on 用还原后的参数
+	reload_cfg
 
 	if [ -f "$d/hijack.nft" ]; then
 		cp -f "$d/hijack.nft" "$NFT_FRAG"
@@ -1447,7 +1592,20 @@ tier_on() {
 # ============================================================
 do_tick() {
 	need_cfg
+	# 每轮重读配置：用户改完参数（保存即 apply，但 daemon 是常驻循环）
+	# 之后，漂移重建 / 降级 / 回切必须用新值，否则就是"保存了个寂寞"。
+	reload_cfg
 	mode=$(s_opt mode); mode=${mode:-off}
+
+	# 依赖对账：缺 curl 时探活降级为「仅 DNS」，页面据此提示用户装包。
+	# 每轮都写一遍，但 st_set 值不变即跳过，所以只有装上/卸掉 curl 那一轮
+	# 才会真正落盘。装完 curl 不重启服务，下一轮 tick（≤55s）提示自动消失。
+	if have_curl; then
+		st_set dep ok
+	else
+		st_set dep no-curl
+	fi
+	st_commit
 
 	# 每轮对账 53 的归属：被占时停手，别在别人的 53 上做迁移
 	conflict_scan
@@ -1519,6 +1677,9 @@ do_tick() {
 # ============================================================
 do_init() {
 	need_cfg
+	# 开机收敛可能要等 WAN（最多 90 秒），期间配置可能已经变了，
+	# 所以先重读一次再决定下发什么。
+	reload_cfg
 	# 开机顺手清掉过期事件，避免时间线无限长（只在低频路径做）
 	ev_prune
 	i=0
@@ -1643,6 +1804,18 @@ do_status() {
 		printf "ADH 探测:    "
 		if probe_adh; then echo "ok"; else echo "fail —— $(probe_reason)"; fi
 	fi
+	# 依赖对账（页面也读这个字段）。缺 curl 不是错误，只是探测精度降级：
+	# 这里顺手把 status.dep 刷一次（值不变 st_set 自动跳过，不写 flash），
+	# 好处是用户装完 curl 跑一次 status，页面刷新就能看到提示消失。
+	if have_curl; then
+		echo "探测依赖:    curl 已装（Web + DNS 双条件探测）"
+		st_set dep ok
+	else
+		echo "探测依赖:    缺 curl（仅按 DNS 探测）—— 装 curl 可提高精度："
+		echo "             apk add curl   /   opkg install curl"
+		st_set dep no-curl
+	fi
+	st_commit
 	echo "ADH 地址:    $ADH:$ADH_PORT"
 	echo "主 DNS:      $ADH（AdGuardHome）"
 	echo "主 DNS v6:   $(detect_adh_v6 2>/dev/null || echo 未探测到)"
