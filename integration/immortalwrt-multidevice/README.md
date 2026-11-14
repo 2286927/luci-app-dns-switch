@@ -63,6 +63,15 @@ MD 仓内**不存放本包任何源码**。换版本只改 `DNS_SWITCH_REF`。
 
 随后 `conclusion=success`，并在 r68s 上确认：菜单「服务 → DNS 网关切换」、页面状态卡、`dns-switch status` 有输出、`apk info -e luci-app-dns-switch` 打印包名、`apk del` 后解析仍正常。
 
-## 七、编译线的前置条件
+## 七、编译线状态（2026-11-14 已跑绿）
 
-MD 仓 r68s 线自 11-10 起因上游 `041-*` rockchip drm backport 补丁失配连续失败（与本包无关）。**接线本身已被 run 34 / run 38 的日志证明有效**，卡点始终是 `target/linux` 编译。修复方式见 `docs/编译线诊断-20261113.md`：在 diy-part2 里整批移除这批显示子系统补丁（路由器无显示输出），待上游 refresh 后再删掉规避段。
+r68s 线曾因两个与**本包无关**的独立问题连续失败，现已全部解决并在
+run `43590895684`（head `5dfe323`）跑绿，固件已发布：
+
+1. `patches-6.12/041-*` rockchip drm backport 补丁失配 → 整批移除（路由器无显示输出）。
+2. dufs 的 `PKG_BUILD_DEPENDS:=rust/host` 拉起 rust `1.96.0`，而上游写死从 CI
+   下载 LLVM 预编译制品，该 commit 已 404 → 在 diy-part2 里把
+   `llvm.download-ci-llvm=true` 改为 `false`，让 rust 用源码自带 LLVM。
+
+两段都是临时规避，上游修复后应删除。完整排障时间线与验收证据见
+`docs/出厂构建验收.md`。
