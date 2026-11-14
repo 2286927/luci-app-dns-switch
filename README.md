@@ -1,5 +1,7 @@
 # luci-app-dns-switch
 
+> **唯一权威源**：本仓库 `main` 与正式 tag 是后续所有开发代码提交的唯一依据，其它位置的代码一律为历史归档、不再作为开发依据。实机测试统一以 r68s（`172.16.1.1`）为准，r68s 固件出厂自带由 MD 仓按 tag 引用本仓实现。详见 [docs/SOURCE_OF_TRUTH.md](docs/SOURCE_OF_TRUTH.md)、[运维手册](docs/运维手册.md)、[MD 仓接入说明](integration/immortalwrt-multidevice/README.md)。
+
 把全屋 DNS 在 **AdGuardHome** 和 **运营商 DNS** 之间一键切换，并且在 DNS 出任何事的时候自己回到「能解析」的状态。
 
 不是又一个 DNS 开关。它要解决的是这个场景：

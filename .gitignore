@@ -9,3 +9,11 @@
 .idea/
 *.swp
 .DS_Store
+
+# 凭据与过程文件（整合时统一排除，2026-11-14）
+*.env
+*token*
+*.log
+*.zip
+*.apk
+*.ipk
