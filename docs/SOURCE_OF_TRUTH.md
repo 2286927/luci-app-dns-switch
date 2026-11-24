@@ -11,7 +11,7 @@
 |---|---|
 | 仓库 | `https://github.com/2286927/luci-app-dns-switch` |
 | 权威分支 | `main` |
-| 正式版本 | 以 tag 为准；当前 `v1.0.0` → `181b76e` |
+| 正式版本 | 以 tag 为准；当前 `v1.0.1` → `d9c056f`（上一版 `v1.0.0` → `181b76e`） |
 | 可见性 | public / MIT |
 
 **其它任何位置的代码都不再作为开发依据**，包括但不限于：
@@ -22,13 +22,16 @@
 
 这些位置统一按**历史归档**处理：可用于查证当时的决策，不得据此改代码、不得据此出包。
 
-## 二、版本基线校验值（v1.0.0）
+## 二、版本基线校验值（v1.0.1）
 
 | 文件 | 大小 | md5 |
 |---|---|---|
-| `luci-app-dns-switch/root/usr/bin/dns-switch` | 65,339 B / 1982 行 | `3ffa3f2aa7173b675d5006b243cb9fda` |
-| `luci-app-dns-switch/htdocs/.../overview.js` | 19,107 B / 511 行 | `16948b00b7d08ae4d55b554809cb1eea` |
-| Release 产物 `luci-app-dns-switch_1.0.0-r1_r38263.apk` | 31,477 B | sha256 `f35c1587efb99acf3ce8cb49d8829d5bb55b82bc523a26bbf9c3ee43c86d44ab` |
+| `luci-app-dns-switch/root/usr/bin/dns-switch` | 65,612 B / 1985 行 | `95bde49df4e20a0c02e58fabe3b1f064` |
+| `luci-app-dns-switch/htdocs/.../overview.js` | 19,107 B / 511 行 | `16948b00b7d08ae4d55b554809cb1eea`（与 v1.0.0 相同） |
+| Release 产物 `luci-app-dns-switch_1.0.1-r1.apk` | 32,018 B | sha256 `6cf107f74dd8b10c4cebabcdbeb9cb23d84afc53004657b6a22b214ab70e619e` |
+
+> v1.0.0 历史基线：主程序 `3ffa3f2aa7173b675d5006b243cb9fda`（65,339 B / 1982 行），
+> apk `31,477 B` sha256 `f35c1587efb99acf3ce8cb49d8829d5bb55b82bc523a26bbf9c3ee43c86d44ab`。
 
 三个运行脚本（`root/usr/bin/dns-switch`、`root/etc/init.d/dns-switch`、`root/etc/uci-defaults/99-dns-switch`）在 git 中的 mode 必须为 `100755`。网页上传会存成 644，而 `luci.mk` 用 `cp -p` 打包会原样带进固件，导致装上去跑不起来；CI 与本地构建前各有一次 `chmod +x` 兜底。
 
