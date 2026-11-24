@@ -11,7 +11,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-dns-switch
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -33,10 +33,27 @@ define Package/$(PKG_NAME)/postinst
 [ -n "$${IPKG_INSTROOT}" ] || {
 	# 用 sh 而不是 . ：这个脚本末尾有 exit 0，source 进来会把 postinst 截断，
 	# 后面的清缓存就执行不到了。
+	#
+	# v1.0.1：apk 安装瞬间 /etc/config/dns_switch 可能处于 copy-up 中间态，
+	# 此时 uci 解析会报 "Parse error (invalid command) at line 5"。v1.0.0 里
+	# 它被 || true 兜住、功能无影响，但会出现在安装输出里。先探测一次，
+	# 不行就重试；三次都不行则保留 uci-defaults 留给下次开机，并记 syslog。
 	if [ -f /etc/uci-defaults/99-dns-switch ]; then
-		sh /etc/uci-defaults/99-dns-switch || true
-		rm -f /etc/uci-defaults/99-dns-switch
+		_ok=0
+		for _i in 1 2 3; do
+			if uci -q show dns_switch >/dev/null 2>&1; then _ok=1; break; fi
+			sleep 1
+		done
+		if [ "$$_ok" = 1 ]; then
+			sh /etc/uci-defaults/99-dns-switch >/dev/null 2>&1 || true
+			rm -f /etc/uci-defaults/99-dns-switch
+		else
+			logger -t dns-switch "postinst: dns_switch 配置暂不可解析，保留 uci-defaults 待下次开机"
+		fi
 	fi
+	# v1.0.1：apk 遇到已存在的 conffile 会留 .apk-new 候选文件，用户永远用不上，
+	# 而且它会被 /etc/config/ 目录保留规则带进下一次升级，直接清掉。
+	rm -f /etc/config/dns_switch.apk-new
 	rm -f /tmp/luci-indexcache
 	rm -rf /tmp/luci-modulecache/* 2>/dev/null
 	exit 0

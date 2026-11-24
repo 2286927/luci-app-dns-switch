@@ -1840,7 +1840,10 @@ do_status() {
 			;;
 	esac
 	if nft list chain inet fw4 dns_hijack >/dev/null 2>&1; then
-		n=$(grep -c 'ether saddr' "$NFT_FRAG" 2>/dev/null)
+		# v1.0.1 R-1：数内核里的运行链，不数磁盘片段。
+		# 切换重建窗口内片段文件可能还没写完，旧实现会误报「0 条」，
+		# 而实际规则是对的 —— 这一行是给人看状态的，必须永远可信。
+		n=$(nft list chain inet fw4 dns_hijack 2>/dev/null | grep -c 'ether saddr')
 		[ -n "$n" ] || n=0
 		echo "劫持链:      在位（ether 豁免: $n 条）"
 	else
