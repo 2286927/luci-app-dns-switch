@@ -3,13 +3,17 @@
 // ============================================================
 // lock_test.uc —— lock.uc 单测
 //
-// 跑法（设备上，**必须从源码树根**跑，跨进程那段要按相对路径找模块）：
-//   ucode test/unit/lock_test.uc
+// 跑法（设备上，源码树内任意目录）：ucode test/unit/lock_test.uc
 // 断言失败 → 退出码 1。
 //
 // 覆盖：正常抢占 / 同进程重入 / 活人持锁抢不到 / 陈旧锁（pid 不存在）接管 /
-//       **真跨进程**：另一个 ucode 进程持锁时抢不到，把它 kill 掉后能陈旧接管 /
-//       放锁后 holder() 为 null
+//       **环境错误与"被占用"必须分开**（前者 E_INTERNAL，后者 E_LOCKED）/
+//       **真跨进程**：另一个 ucode 进程持锁时抢不到，kill -9 后能陈旧接管 /
+//       放锁必须"放干净"（目录本身不存在）/ 收尾自清
+//
+// 关于 take/drop 的返回值：v2 起不是 bool 而是对象（见 lock.uc 文件头）：
+//   take → { ok:true, dir, pid } | { ok:false, reason:'locked', holder } | { ok:false, reason:'env', message }
+//   drop → { ok:true } | { ok:false, reason:'not-owner' } | { ok:false, reason:'env', message }
 // ============================================================
 
 import * as lock from '../../luci-app-dns-switch/root/usr/libexec/dns-switch/lock.uc';
@@ -24,11 +28,6 @@ const MARKER = BASE + '/child-ready';
 let pass = 0;
 let fail = 0;
 
-function ok(name, cond) {
-	if (cond === true) { pass++; print("PASS  " + name + "\n"); }
-	else { fail++; print("FAIL  " + name + "\n"); }
-}
-
 // 注意：ucode 的 type(null) 返回 null 本身（不是字符串 "null"），判空一律 === null
 function show(v) {
 	let t = type(v);
@@ -37,6 +36,11 @@ function show(v) {
 	if (t == 'int') return sprintf("%d", v);
 	if (t == 'bool') return v ? "true" : "false";
 	return "(" + t + ")";
+}
+
+function ok(name, cond) {
+	if (cond === true) { pass++; print("PASS  " + name + "\n"); }
+	else { fail++; print("FAIL  " + name + "\n"); }
 }
 
 function eq(name, got, want) {
@@ -76,13 +80,31 @@ function self_pid() {
 	return (m != null) ? +m[1] : 0;
 }
 
+// 找模块文件：ucode 拿不到"本脚本路径"（ARGV 只有额外参数，实测），
+// 所以从 cwd 逐级往上找。这样在仓库根、test/unit、任意子目录跑都能找到。
+function find_module(rel) {
+	let dir = fs.getcwd();
+	for (let i = 0; i < 8; i++) {
+		let cand = dir + '/' + rel;
+		if (fs.stat(cand) != null) return cand;
+		let parent = fs.dirname(dir);
+		if (parent == dir) break;
+		dir = parent;
+	}
+	return null;
+}
+
 // ---- 干净起步 ----
 wipe(BASE); fs.rmdir(BASE);
 mkdir_p(BASE);
 
 // ---- 1. 正常抢占 ----
 eq("初始没有持锁者", lock.holder({ dir: DIR }), null);
-eq("take() 成功", lock.take({ dir: DIR }), true);
+
+let r = lock.take({ dir: DIR });
+eq("take() ok", r.ok, true);
+eq("take() 回报 dir", r.dir, DIR);
+eq("take() 回报自己的 pid", r.pid, self_pid());
 
 let h = lock.holder({ dir: DIR });
 ok("holder() 不是 null", h != null);
@@ -93,46 +115,74 @@ eq("holder().since 是 int", type(h.since), "int");
 ok("holder().age >= 0", h.age >= 0);
 
 // ---- 2. 同进程重入不卡自己 ----
-eq("同进程再 take() 返回 true", lock.take({ dir: DIR }), true);
+r = lock.take({ dir: DIR });
+eq("同进程再 take() 仍 ok", r.ok, true);
 
-// ---- 3. 放锁 ----
-eq("drop() 成功", lock.drop({ dir: DIR }), true);
-eq("放锁后目录没了", lock.holder({ dir: DIR }), null);
-eq("没持锁时 drop() 返回 false（不误删）", lock.drop({ dir: DIR }), false);
+// ---- 3. 放锁：必须"放干净"，不只是"看起来没持有" ----
+r = lock.drop({ dir: DIR });
+eq("drop() ok", r.ok, true);
+eq("放锁后 holder() 为 null", lock.holder({ dir: DIR }), null);
+eq("放锁后锁目录本身已不存在（不留残留）", fs.stat(DIR), null);
+r = lock.drop({ dir: DIR });
+eq("没持锁时 drop() ok=false", r.ok, false);
+eq("没持锁时 drop() reason=not-owner", r.reason, "not-owner");
 
-// ---- 4. 活人持锁 → 抢不到（用 pid 1 假冒持锁者，init 一定活着）----
+// ---- 4. 活人持锁 → 抢不到，且必须报 locked（不是 env）----
 mkdir_p(DIR);
-fs.writefile(DIR + '/pid', "1\n");
+fs.writefile(DIR + '/pid', "1\n");              // pid 1 = init，一定活着
 fs.writefile(DIR + '/since', sprintf('%d\n', time()));
 h = lock.holder({ dir: DIR });
 eq("他人持锁 alive=true", h.alive, true);
 eq("他人持锁 pid=1", h.pid, 1);
-eq("活人持锁时 take() = false", lock.take({ dir: DIR }), false);
+
+r = lock.take({ dir: DIR });
+eq("活人持锁时 take() ok=false", r.ok, false);
+eq("活人持锁时 reason=locked", r.reason, "locked");
+ok("reason 不是 env（环境错误不许冒充被占用）", r.reason != "env");
+ok("locked 时带回 holder", r.holder != null);
+eq("locked 时 holder.pid=1", r.holder.pid, 1);
 eq("抢失败不动别人的锁", lock.holder({ dir: DIR }).pid, 1);
-eq("抢失败后 drop() 不删别人的锁", lock.drop({ dir: DIR }), false);
+r = lock.drop({ dir: DIR });
+eq("抢失败后 drop() ok=false", r.ok, false);
+eq("抢失败后 drop() reason=not-owner", r.reason, "not-owner");
 eq("别人的锁还在", lock.holder({ dir: DIR }).pid, 1);
 
-// ---- 5. 陈旧锁（pid 不存在）→ 接管 ----
+// ---- 5. 环境错误 ≠ 被占用（N21：混为一谈会变成静默死锁）----
+// 造一个"父路径是普通文件"的场景：目录必然建不出来，且不是"被占用"
+let notadir = BASE + '/not-a-dir';
+fs.writefile(notadir, "x");
+r = lock.take({ dir: notadir + '/lock.d' });
+eq("环境错误时 take() ok=false", r.ok, false);
+eq("环境错误时 reason=env", r.reason, "env");
+ok("env 的 message 指出是建目录失败（人话）", match(r.message, /创建目录失败/) != null);
+ok("环境错误**不许**报成 locked（否则用户永远看到「另一实例在跑」）", r.reason != "locked");
+eq("环境错误后没有留下锁目录", fs.stat(notadir + '/lock.d'), null);
+fs.unlink(notadir);
+
+// ---- 6. 陈旧锁（pid 不存在）→ 接管 ----
 fs.writefile(DIR + '/pid', "999999\n");
 eq("陈旧锁 stale=true", lock.holder({ dir: DIR }).stale, true);
-eq("陈旧锁 take() 能接管", lock.take({ dir: DIR }), true);
+r = lock.take({ dir: DIR });
+eq("陈旧锁 take() 能接管", r.ok, true);
 eq("接管后 pid 变成自己", lock.holder({ dir: DIR }).pid, self_pid());
 eq("接管后没有 .stale/.new 残留",
 	length(filter(fs.lsdir(BASE), function (n) { return match(n, /\.(stale|new)\./) != null; })), 0);
-eq("cleanup: drop", lock.drop({ dir: DIR }), true);
+r = lock.drop({ dir: DIR });
+eq("cleanup: drop ok", r.ok, true);
 
-// ---- 6. 真跨进程：另一个 ucode 进程按同一协议持锁 ----
-let modpath = fs.getcwd() + '/luci-app-dns-switch/root/usr/libexec/dns-switch/lock.uc';
-if (fs.stat(modpath) == null) {
+// ---- 7. 真跨进程：另一个 ucode 进程按同一协议持锁 ----
+let modpath = find_module('luci-app-dns-switch/root/usr/libexec/dns-switch/lock.uc');
+if (modpath == null) {
 	fail++;
-	printf("FAIL  找不到 %s（请从源码树根目录运行本测试）\n", modpath);
+	printf("FAIL  找不到 lock.uc（cwd=%s，请在源码树内运行本测试）\n", fs.getcwd());
 }
 else {
 	let text = join('\n', [
 		"'use strict';",
 		sprintf("import * as lock from '%s';", modpath),
 		"let fs = require('fs');",
-		sprintf("if (lock.take({ dir: '%s' }) !== true) { print(\"CHILD_TAKE_FAILED\\n\"); exit(2); }", DIR),
+		sprintf("let r = lock.take({ dir: '%s' });", DIR),
+		"if (r.ok !== true) { print(\"CHILD_TAKE_FAILED\\n\"); exit(2); }",
 		sprintf("fs.writefile('%s', sprintf('%%d\\n', 1));", MARKER),
 		"let p = fs.popen('sleep 8', 'r');",
 		"if (p != null) p.close();",
@@ -156,19 +206,36 @@ else {
 	ok("跨进程：holder() 看得到对方", h != null);
 	eq("跨进程：对方 alive", h.alive, true);
 	ok("跨进程：对方 pid 不是自己", h.pid != self_pid());
-	eq("跨进程：抢不到", lock.take({ dir: DIR }), false);
+
+	r = lock.take({ dir: DIR });
+	eq("跨进程：抢不到", r.ok, false);
+	eq("跨进程：reason=locked", r.reason, "locked");
+	eq("跨进程：held.pid 就是对方", r.holder.pid, h.pid);
 	eq("跨进程：抢失败后锁还在对方手里", lock.holder({ dir: DIR }).pid, h.pid);
 
 	// 把它 kill -9，等 /proc 里消失
-	let r = fs.popen('kill -9 ' + h.pid + ' 2>/dev/null', 'r');
-	if (r != null) r.close();
+	let k = fs.popen('kill -9 ' + h.pid + ' 2>/dev/null', 'r');
+	if (k != null) k.close();
 	t0 = time();
 	while (fs.stat('/proc/' + h.pid) != null && time() - t0 < 4) { /* spin */ }
 	eq("跨进程：对方已死", fs.stat('/proc/' + h.pid), null);
-	eq("跨进程：陈旧锁接管成功", lock.take({ dir: DIR }), true);
+
+	r = lock.take({ dir: DIR });
+	eq("跨进程：陈旧锁接管成功", r.ok, true);
 	eq("跨进程：接管后 holder 是自己", lock.holder({ dir: DIR }).pid, self_pid());
-	eq("跨进程：收尾 drop", lock.drop({ dir: DIR }), true);
+	r = lock.drop({ dir: DIR });
+	eq("跨进程：收尾 drop ok", r.ok, true);
+	eq("跨进程：收尾后锁目录已不存在", fs.stat(DIR), null);
+	eq("跨进程：收尾后没有 .new/.stale 残留",
+		length(filter(fs.lsdir(BASE), function (n) { return match(n, /\.(stale|new)\./) != null; })), 0);
 }
+
+// ---- 8. 收尾：把自己的临时目录也清掉（下一轮/CI 是干净起点）----
+fs.unlink(MARKER);
+fs.unlink(CHILD);
+wipe(BASE);
+fs.rmdir(BASE);
+eq("收尾：临时目录已删除", fs.stat(BASE), null);
 
 printf("\n%s: %d passed, %d failed\n", "lock_test", pass, fail);
 exit(fail == 0 ? 0 : 1);

@@ -57,8 +57,30 @@ function wipe_dir(dir) {
 	}
 }
 
-wipe_dir(BASE); fs.rmdir(BASE);
-fs.mkdir(BASE);
+// fs.mkdir 不建父目录（lock.uc 里也踩过这条），而 /tmp/ds-v11 在全新机器上
+// 根本不存在 —— 必须自己把父目录补齐，否则"干净起点跑单测"直接 E_UCI_COMMIT。
+function mkdir_p(path) {
+	let st = fs.stat(path);
+	if (st != null && st.type == 'directory') return true;
+	let parent = fs.dirname(path);
+	if (parent != path) mkdir_p(parent);
+	fs.mkdir(path);
+	st = fs.stat(path);
+	return (st != null && st.type == 'directory');
+}
+
+// 收尾用：目录不存在时跳过。实测 fs.rmdir / fs.unlink 对不存在的路径都是**返回
+// null、不抛异常**，所以这里显式判 stat 不是为了防崩，而是为了"到底删没删掉"
+// 这件事能被断言（返回值 null 无法区分"删掉了"和"本来就没有"）。
+function rm_if_exists(path) {
+	let st = fs.stat(path);
+	if (st == null) return true;
+	if (st.type == 'directory') { wipe_dir(path); return fs.rmdir(path) != null; }
+	return fs.unlink(path) != null;
+}
+
+rm_if_exists(BASE);
+mkdir_p(BASE);
 
 // ---- 0. 没 load() 就 commit()：不许静默成功 ----
 let r = config.commit();
@@ -169,8 +191,10 @@ eq("目录不存在时 load() ok=false", bad.ok, false);
 eq("目录不存在时 code=E_UCI_COMMIT", bad.code, "E_UCI_COMMIT");
 ok("失败时带人话 message", type(bad.message) == "string" && length(bad.message) > 0);
 
-wipe_dir(BASE); fs.rmdir(BASE);
-fs.rmdir('/tmp/ds-v11/ut-cfg-nodir');
+// ---- 11. 收尾：把自己的临时目录清干净，下一轮/CI 才是干净起点 ----
+eq("收尾：ut-cfg 已删除", rm_if_exists(BASE), true);
+eq("收尾：ut-cfg-nodir 已删除", rm_if_exists('/tmp/ds-v11/ut-cfg-nodir'), true);
+eq("收尾：ut-cfg 目录确实不存在", fs.stat(BASE), null);
 
 printf("\n%s: %d passed, %d failed\n", "config_test", pass, fail);
 exit(fail == 0 ? 0 : 1);

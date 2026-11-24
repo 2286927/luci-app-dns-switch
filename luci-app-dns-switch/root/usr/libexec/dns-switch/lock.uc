@@ -13,16 +13,39 @@
 // 加锁用「先搭后换」两步，全程没有「目录已在但 pid 文件还没写」的中间态：
 //   1. 在 <dir>.new.<pid>.<ts> 建目录，写好 pid/since
 //   2. rename 成 <dir>
-//      —— 目标已存在且非空时 rename 必然失败（实测 dir→nonempty = null），
+//      —— 目标是非空目录时 rename 必然失败（实测 "Directory not empty"），
 //         这就是"只有一个人能进去"的判据；目标若是空目录，rename 直接顶替，也对
 //   3. rename 失败 → 看持锁者活没活：
-//        活着        → return false（正常抢占失败，不抛异常）
+//        活着        → 返回 reason='locked'（**不是**环境错误）
 //        已死        → 把旧目录 rename 到 .stale.<pid>.<ts> 让位，再抢一次
-//      两个进程同时判陈旧时，rename/mkdir 只有一个能成功，输的那个 return false
 //
-// 存活判定：/proc/<pid> 是否存在（fs.stat，实测不存在返回 null）。
-// 不做 pid 复用校验（真机上极端场景：锁持有者被 kill 后 pid 立刻被别的进程占用，
-// 会多等一次 tick，不会错乱状态）——记在注记里，别当已知缺陷反复排查。
+// ------------------------------------------------------------
+// 返回值（v2，见 DECISIONS/IMPL-NOTES N21）
+//
+//   take(opts) → { ok:true, dir, pid }
+//              | { ok:false, reason:'locked', holder:{pid,alive,since,age,stale} }
+//              | { ok:false, reason:'env',    message }
+//   drop(opts) → { ok:true }
+//              | { ok:false, reason:'not-owner' }
+//              | { ok:false, reason:'env', message }
+//   holder(opts) → null | { pid, alive, since, age, stale }
+//
+// 为什么 take() 不再是 bool：**"锁被别人占"和"环境坏了"必须分开**。
+// 两者都返回 false 时，调用方只能一律映射成 E_LOCKED（CLI rc=75）→
+// 一旦 /var 满或只读，用户会永远看到"另一个实例在跑，稍后再试"，
+// 而实际上永远不会成功 —— 静默死锁，且看起来像正常行为。
+//
+// ------------------------------------------------------------
+// fs.error() 的两条实测铁律（踩过就记牢）
+//   1. **只在调用返回 null/false 之后读，且必须紧跟下一句**。
+//      中间插任何 fs 调用（哪怕只是 fs.stat）都会被清成 null，
+//      于是"失败"被读成"没有错误" → 误判成功。
+//   2. **成功之后不要读**：mkdir 成功会清成 null，但 rename 成功可能留下
+//      上一次的旧文案。所以本文件只在失败分支取 error。
+//
+// 另：fs.mkdir 对「已存在」和「父目录缺失」都返回 null（实测），
+// 靠 error 文案区分（"File exists" / "No such file or directory"）；
+// fs.rmdir / fs.unlink 对不存在的路径返回 null 且**不抛异常**。
 //
 // 与 v1.0.1 的差异：锁路径按 SPEC §3.2 由 `/var/lock/dns-switch.lock`（flock 文件）
 // 改为 `/var/lock/dns-switch.lock.d`（目录）。跨版本互斥**不靠锁本身**，靠
@@ -38,8 +61,24 @@ const NEW_SUFFIX = '.new.';
 const STALE_SUFFIX = '.stale.';
 const PROC = '/proc';
 
+// rename 撞上"目标非空目录"时的文案；"File exists" 兜一层（不同内核/实现对
+// rename 到非空目录可能报 EEXIST 而不是 ENOTEMPTY）
+const E_NOTEMPTY = 'Directory not empty';
+const E_EXIST = 'File exists';
+
 let held = null;    // { dir, pid }：本进程当前持有的锁
 let mypid = null;
+
+function env_fail(message) {
+	return { ok: false, reason: 'env', message: message };
+}
+
+// 只在失败的 fs 调用**紧跟**着用（见文件头铁律 1）
+function err_text() {
+	let e = fs.error();
+	if (type(e) == 'string' && length(e)) return e;
+	return 'unknown';
+}
 
 // ucode 没有 getpid()，只能读 /proc/self/stat 第一列
 function self_pid() {
@@ -62,19 +101,25 @@ function lockdir(opts) {
 	return DIR_DEFAULT;
 }
 
-// fs.mkdir 不建父目录（实测：父目录缺失 → null），所以自己来
-function mkdir_p(path) {
-	if (type(path) != 'string' || !length(path) || path == '/') return true;
+// mkdir -p（fs.mkdir 不建父目录，实测），失败要把**原因**带出来
+function ensure_dir(path) {
+	if (type(path) != 'string' || !length(path) || path == '/') return { ok: true };
 
 	let st = fs.stat(path);
-	if (st != null && st.type == 'directory') return true;
+	if (st != null && st.type == 'directory') return { ok: true };
 
 	let parent = fs.dirname(path);
-	if (parent != path) mkdir_p(parent);
+	if (parent == path) return env_fail(sprintf('无法创建目录：%s', path));
 
-	if (fs.mkdir(path) === true) return true;
-	st = fs.stat(path);
-	return (st != null && st.type == 'directory');
+	let pd = ensure_dir(parent);
+	if (!pd.ok) return pd;
+
+	let r = fs.mkdir(path);
+	if (r === true) return { ok: true };
+	let err = err_text();                 // 必须紧跟 mkdir
+	let st2 = fs.stat(path);              // 取完 error 再 stat
+	if (st2 != null && st2.type == 'directory') return { ok: true };   // EEXIST 且确实是目录
+	return env_fail(sprintf('创建目录失败：%s（%s）', path, err));
 }
 
 function alive(pid) {
@@ -112,8 +157,11 @@ function clear_dir(dir) {
 }
 
 function write_stamp(dir, pid) {
-	if (fs.writefile(dir + '/pid', sprintf('%d\n', pid)) == null) return false;
-	return fs.writefile(dir + '/since', sprintf('%d\n', time())) != null;
+	let a = fs.writefile(dir + '/pid', sprintf('%d\n', pid));
+	if (a == null) return env_fail(sprintf('写 pid 文件失败：%s/pid（%s）', dir, err_text()));
+	let b = fs.writefile(dir + '/since', sprintf('%d\n', time()));
+	if (b == null) return env_fail(sprintf('写 since 文件失败：%s/since（%s）', dir, err_text()));
+	return { ok: true };
 }
 
 /**
@@ -140,55 +188,78 @@ export function holder(opts) {
 }
 
 /**
- * 抢锁。成功 true，被占/出错 false（**不抛异常**，调用方按 E_LOCKED 处理）。
+ * 抢锁。返回 { ok:true } / { ok:false, reason:'locked' } / { ok:false, reason:'env' }。
+ * **不抛异常**；reason='env' 说明是环境问题（目录建不出来、盘满、只读），
+ * 调用方应映射成 E_INTERNAL 而不是 E_LOCKED。
  */
 export function take(opts) {
 	let dir = lockdir(opts);
 
 	// 同进程重入：daemon 里 do_on 内部又调 do_tick 这类路径不该自己卡自己
-	if (held != null && held.dir == dir) return true;
+	if (held != null && held.dir == dir) return { ok: true, dir: dir, pid: held.pid };
 
 	let pid = self_pid();
-	if (pid <= 0) return false;
-	if (!mkdir_p(fs.dirname(dir))) return false;
+	if (pid <= 0) return env_fail('取不到自身 pid（读 /proc/self/stat 失败）');
+
+	let pd = ensure_dir(fs.dirname(dir));
+	if (!pd.ok) return pd;
 
 	let tmp = sprintf('%s%s%d.%d', dir, NEW_SUFFIX, pid, time());
 	clear_dir(tmp);
-	if (fs.mkdir(tmp) !== true) return false;
-	if (!write_stamp(tmp, pid)) {
+
+	let mk = fs.mkdir(tmp);
+	if (mk !== true) {
+		return env_fail(sprintf('建临时锁目录失败：%s（%s）', tmp, err_text()));
+	}
+	let ws = write_stamp(tmp, pid);
+	if (!ws.ok) {
 		clear_dir(tmp);
-		return false;
+		return ws;
 	}
 
-	if (fs.rename(tmp, dir) === true) {
+	let moved = fs.rename(tmp, dir);
+	if (moved === true) {
 		held = { dir: dir, pid: pid };
-		return true;
+		return { ok: true, dir: dir, pid: pid };
+	}
+	let rerr = err_text();     // 必须紧跟 rename
+
+	// 只有"目标非空"才算被别人占，其余一律环境错误（否则会变成静默死锁）
+	if (rerr != E_NOTEMPTY && rerr != E_EXIST) {
+		clear_dir(tmp);
+		return env_fail(sprintf('rename 到锁目录失败：%s（%s）', dir, rerr));
 	}
 
-	// 已被占：活人持锁就老实退出
 	let h = holder({ dir: dir });
 	if (h != null && h.alive) {
 		clear_dir(tmp);
-		return false;
+		return { ok: false, reason: 'locked', holder: h };
 	}
 
 	// 陈旧锁：把旧目录挪走让位，再抢一次
 	let grave = sprintf('%s%s%d.%d', dir, STALE_SUFFIX, pid, time());
-	if (fs.rename(dir, grave) !== true) {
+	let g = fs.rename(dir, grave);
+	if (g !== true) {
 		clear_dir(tmp);
-		return false;
+		return env_fail(sprintf('接管陈旧锁失败：%s（%s）', dir, err_text()));
 	}
 
 	let won = (fs.rename(tmp, dir) === true);
-	if (won) held = { dir: dir, pid: pid };
-	else clear_dir(tmp);
+	if (won) {
+		held = { dir: dir, pid: pid };
+	}
+	else {
+		clear_dir(tmp);
+	}
 	clear_dir(grave);
-	return won;
+	if (won) return { ok: true, dir: dir, pid: pid };
+	return env_fail(sprintf('接管陈旧锁后仍抢不到：%s', dir));
 }
 
 /**
- * 放锁。真的放开 / 本来就没拿着都返回 true；
- * 发现锁已不归自己（被别的进程当陈旧锁接管）返回 false 且**不动**别人的目录。
+ * 放锁。真放开 → { ok:true }；
+ * 发现锁已不归自己（被别的进程当陈旧锁接管）→ { ok:false, reason:'not-owner' } 且
+ * **不动**别人的目录；目录删不干净 → { ok:false, reason:'env' }。
  */
 export function drop(opts) {
 	let dir = lockdir(opts);
@@ -202,8 +273,11 @@ export function drop(opts) {
 
 	if (!mine) {
 		let owner = read_int(dir + '/pid');
-		if (owner == null || pid <= 0 || owner != pid) return false;
+		if (owner == null || pid <= 0 || owner != pid) {
+			return { ok: false, reason: 'not-owner' };
+		}
 	}
 
-	return clear_dir(dir);
+	if (clear_dir(dir)) return { ok: true };
+	return env_fail(sprintf('放锁时锁目录没删干净：%s', dir));
 }
