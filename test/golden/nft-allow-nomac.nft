@@ -1,0 +1,13 @@
+# 由 dns-switch 生成，请勿手改（改 uci dns_switch 或重跑 dns-switch on）
+# 853（DoT/DoQ）策略：放行，本文件不产生任何 853 规则
+chain dns_hijack {
+	type nat hook prerouting priority -95; policy accept;
+
+	ip saddr 172.16.1.2 udp dport 53 accept
+	ip saddr 172.16.1.2 tcp dport 53 accept
+
+	meta nfproto ipv4 udp dport 53 redirect to :53
+	meta nfproto ipv4 tcp dport 53 redirect to :53
+	meta nfproto ipv6 udp dport 53 redirect to :53
+	meta nfproto ipv6 tcp dport 53 redirect to :53
+}

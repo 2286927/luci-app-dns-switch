@@ -1,0 +1,27 @@
+# 由 dns-switch 生成，请勿手改（改 uci dns_switch 或重跑 dns-switch on）
+# 853（DoT/DoQ）策略：拦截
+chain dns_hijack {
+	type nat hook prerouting priority -95; policy accept;
+
+	ether saddr aa:bb:cc:dd:ee:ff udp dport 53 accept
+	ether saddr aa:bb:cc:dd:ee:ff tcp dport 53 accept
+	ip saddr 172.16.1.2 udp dport 53 accept
+	ip saddr 172.16.1.2 tcp dport 53 accept
+
+	meta nfproto ipv4 udp dport 53 redirect to :53
+	meta nfproto ipv4 tcp dport 53 redirect to :53
+	meta nfproto ipv6 udp dport 53 redirect to :53
+	meta nfproto ipv6 tcp dport 53 redirect to :53
+}
+
+chain dot_block {
+	type filter hook forward priority filter + 10; policy accept;
+
+	ether saddr aa:bb:cc:dd:ee:ff tcp dport 853 accept
+	ether saddr aa:bb:cc:dd:ee:ff udp dport 853 accept
+	ip saddr 172.16.1.2 tcp dport 853 accept
+	ip saddr 172.16.1.2 udp dport 853 accept
+
+	tcp dport 853 reject with tcp reset
+	udp dport 853 reject
+}
