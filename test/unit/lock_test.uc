@@ -159,6 +159,20 @@ ok("环境错误**不许**报成 locked（否则用户永远看到「另一实�
 eq("环境错误后没有留下锁目录", fs.stat(notadir + '/lock.d'), null);
 fs.unlink(notadir);
 
+// ---- 5b. 锁路径上被一个普通文件占着 → 响亮报 env，**不许静默顶替** ----
+// 悄悄删掉别人的东西比报错更难查；而 rename(dir→已存在 file) 实测必然失败，
+// 所以这条路走的就是 take() 里那句 stat 复核。
+let junk = BASE + '/junk-lock';
+fs.writefile(junk, "garbage");
+r = lock.take({ dir: junk });
+eq("锁路径是普通文件 → take() ok=false", r.ok, false);
+eq("锁路径是普通文件 → reason=env", r.reason, "env");
+ok("message 指出被非目录占用", match(r.message, /非目录占用/) != null);
+eq("没有把占位的文件删掉（不静默顶替）", fs.readfile(junk), "garbage");
+eq("这条路径也没留下 .new 临时目录",
+	length(filter(fs.lsdir(BASE), function (n) { return match(n, /\.new\./) != null; })), 0);
+fs.unlink(junk);
+
 // ---- 6. 陈旧锁（pid 不存在）→ 接管 ----
 fs.writefile(DIR + '/pid', "999999\n");
 eq("陈旧锁 stale=true", lock.holder({ dir: DIR }).stale, true);

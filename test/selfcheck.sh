@@ -116,15 +116,16 @@ fi
 # inject <名字> <门禁标签> <注入命令...>
 inject() {
 	name=$1; tag=$2; shift 2
-	d="$T/bad-$tag"
+	slug=$(printf '%s' "$tag" | tr '/' '-')      # 2/6 → 2-6，不能直接当目录名
+	d="$T/bad-$slug"
 	rm -rf "$d"; cp -r "$T/good" "$d"
 	( cd "$d" && "$@" ) || { bad "样本 $name 注入失败"; return; }
-	if ! run_gate "$d" "$T/bad-$tag.log" >/dev/null; then : ; fi
-	if gate_is_fail "$T/bad-$tag.log" "$tag"; then
+	run_gate "$d" "$T/bad-$slug.log" >/dev/null || :
+	if gate_is_fail "$T/bad-$slug.log" "$tag"; then
 		ok "坏样本 $name → 门禁 $tag 报红"
 	else
 		bad "坏样本 $name → 门禁 $tag **没有报红**（假绿）"
-		sed -n '/结论/,$p' "$T/bad-$tag.log" | sed 's/^/        /'
+		sed -n '/结论/,$p' "$T/bad-$slug.log" | sed 's/^/        /'
 	fi
 }
 

@@ -1,4 +1,5 @@
 config.uc
+fsutil.uc
 lock.uc
 log.uc
 sh.uc
