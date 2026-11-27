@@ -39,6 +39,7 @@ VERBOSE=0
 ISOLATED=0
 SELFTEST=0
 UNIT_DIR="$HERE"
+SPEC="${SPEC:-}"
 MODULE_ONLY=0
 
 while [ $# -gt 0 ]; do
@@ -48,7 +49,8 @@ while [ $# -gt 0 ]; do
 		--selftest) SELFTEST=1 ;;
 		--unit-only) MODULE_ONLY=1 ;;
 		--unit-dir) shift; UNIT_DIR="${1:-}" ;;
-		*) echo "未知参数：$1（可用：--verbose --isolated --selftest --unit-only --unit-dir DIR）"; exit 2 ;;
+		--spec) shift; SPEC="${1:-}" ;;
+		*) echo "未知参数：$1（可用：--verbose --isolated --selftest --unit-only --unit-dir DIR --spec PATH）"; exit 2 ;;
 	esac
 	shift
 done
@@ -242,11 +244,40 @@ if [ "$MODULE_ONLY" = 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 4) A4 本地门禁（需要 SPEC.md）—— 由本脚本调度，避免 gates_local.sh 没人跑
+#
+# 探测顺序：--spec 参数 > 环境变量 SPEC > 仓库同级目录的 dns-switch-v11-*/SPEC.md
+# 找不到时不计 PASS 也不计 SKIP，只在结论区单独打一行——让人一眼看到"A4 没跑"。
+# ---------------------------------------------------------------------------
+SPEC_NOTE=""
+if [ "$MODULE_ONLY" = 0 ]; then
+	if [ -z "$SPEC" ]; then
+		for c in "$PKG/../../dns-switch-v11-"*/SPEC.md "$PKG/../dns-switch-v11-"*/SPEC.md; do
+			[ -f "$c" ] && { SPEC=$c; break; }
+		done
+	fi
+	if [ -f "$PKG/test/gates_local.sh" ] && [ -n "$SPEC" ] && [ -f "$SPEC" ]; then
+		of="$OUTBASE/run_all.$$.gates_local.log"
+		sh "$PKG/test/gates_local.sh" --spec "$SPEC" > "$of" 2>&1
+		rc=$?
+		verdict_generic "gates_local" "$of" "$rc" '^== 结论：'
+		grep -E '^== 结论' "$of" | sed 's/^/        /'
+		[ "$VERBOSE" = 1 ] && sed 's/^/        /' "$of" | head -80
+		rm -f "$of" 2>/dev/null || :
+	else
+		SPEC_NOTE="A4 未执行（无 SPEC）—— 发版前请用 --spec PATH 或 SPEC=… 跑一次"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
 # 汇总
 # ---------------------------------------------------------------------------
 printf '\n== 合计：%d 组件 / %d 单测断言 / %d 失败' "$NS" "$NASSERT" "$NF"
 [ "$NWARN" != 0 ] && printf ' / %d 条 WARN' "$NWARN"
 printf ' ==\n'
+if [ -n "${SPEC_NOTE:-}" ]; then
+	printf '   %s\n' "$SPEC_NOTE"
+fi
 if [ "$NF" != 0 ]; then
 	printf '   失败组件：%s\n' "$FAILED"
 	printf '== 结论：FAIL ==\n'

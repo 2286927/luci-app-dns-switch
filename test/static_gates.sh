@@ -556,18 +556,14 @@ fi
 #     U+1F300–1F9FF F0 9F 8C–A7 xx    U+FE0F(VS16)  EF B8 8F
 # ============================================================================
 G5="5/6 无 emoji"
+# N33 禁用清单：grep -P / od / xxd / comm / diff 一律不用。
+# 只认 hexdump：od 在 r68s 上不存在，而"命令缺失 + 管道为空"会让扫描静默变空 → 判 PASS。
 BYTES_TOOL=""
-if command -v hexdump >/dev/null 2>&1; then BYTES_TOOL=hexdump
-elif command -v od >/dev/null 2>&1; then BYTES_TOOL=od
-fi
+if command -v hexdump >/dev/null 2>&1; then BYTES_TOOL=hexdump; fi
 
 # 取字节流：统一成"若干十进制数"，awk 用 NF 逐个吃（hexdump 一行一个，od 一行多个）
 byte_stream() {
-	if [ "$BYTES_TOOL" = hexdump ]; then
-		hexdump -v -e '1/1 "%u\n"' "$1" 2>/dev/null
-	else
-		od -A n -v -t u1 "$1" 2>/dev/null
-	fi
+	hexdump -v -e '1/1 "%u\n"' "$1" 2>/dev/null
 }
 
 # 输出 "行号<TAB>区间"
@@ -589,7 +585,7 @@ scan_emoji() {
 }
 
 if [ -z "$BYTES_TOOL" ]; then
-	F "$G5" "本机既没有 hexdump 也没有 od → 无法取字节流。空转不许算通过。"
+	F "$G5" "本机没有 hexdump → 无法取字节流。空转不许算通过（N33）。"
 else
 	# 自检：造一个已知 emoji（U+1F525），必须被扫出来
 	printf '\360\237\224\245' > "$TMPD/probe.bin"
@@ -698,79 +694,6 @@ else
 			P "$G6" "10 个 ubus 方法在 ACL 里全覆盖，且无多余方法"
 		else
 			F "$G6" "缺 $nmiss 个 / 多 $nextra 个"
-		fi
-	fi
-fi
-
-# ============================================================================
-# A4 导出列一致性（SPEC §3.2「对外导出」列 ↔ 各模块 ^export 名单）—— 双向
-#
-# **必须双向**：只查"SPEC 声明的都有实现"会漏掉反方向——真实漂移恰恰是
-# "SPEC 少写了"（声明 `set(k,v)`，实际是 open/get/set_status/commit）。
-#
-# SPEC 表格是手写散文，解析规则单独放在 test/audit_exports.awk（可单独跑、单独验）。
-# 三个坑都在那个文件头部写明：反引号内的竖线会截断整行、括号注释里会提到非导出名、
-# 斜杠组只取到第一个。
-#
-# SPEC 在仓库外，CI 里通常没有 → 找不到就 **SKIP 并点名**，绝不当通过。
-# 显式指定：SPEC=/path/to/SPEC.md sh test/static_gates.sh
-# ============================================================================
-G7="A4 导出列一致性"
-SPEC="${SPEC:-}"
-if [ -z "$SPEC" ]; then
-	for c in "$PKG/../../dns-switch-v11-"*/SPEC.md "$PKG/../dns-switch-v11-"*/SPEC.md; do
-		[ -f "$c" ] && { SPEC=$c; break; }
-	done
-fi
-if [ ! -d "$MODDIR" ]; then
-	S "$G7" "模块目录不存在"
-elif [ ! -f "$HERE/audit_exports.awk" ]; then
-	F "$G7" "缺 test/audit_exports.awk（解析器不在，这条门禁无从校验）"
-elif [ -z "$SPEC" ] || [ ! -f "$SPEC" ]; then
-	S "$G7" "找不到 SPEC.md → 无法比对外导出（设 SPEC=/path/to/SPEC.md 后本门禁才生效）"
-else
-	awk -f "$HERE/audit_exports.awk" "$SPEC" | sort -u > "$TMPD/spec.exports"
-	awk '/^export (function|const|let) /{
-			n = $3; sub(/[(].*/, "", n); printf "%s %s\n", FILENAME, n
-		}' "$MODDIR"/*.uc 2>/dev/null \
-		| sed 's#.*/dns-switch/##; s#[.]uc # #' | sort -u > "$TMPD/code.exports"
-
-	if [ ! -s "$TMPD/spec.exports" ]; then
-		S "$G7" "SPEC 里解析不出 §3.2 的导出列（表结构变了？先修门禁，不许当作通过）"
-	elif [ ! -s "$TMPD/code.exports" ]; then
-		S "$G7" "代码里没有任何 export（模块还没写？）"
-	else
-		nf7=0
-		awk '{print $1}' "$TMPD/code.exports" | sort -u > "$TMPD/code.mods"
-		awk '{print $1}' "$TMPD/spec.exports" | sort -u > "$TMPD/spec.mods"
-		# 注意：**不要用 comm**。r68s 上没有 comm（和 diff / od 一样没编进 busybox），
-		# 缺了它 `$(comm ...)` 静默输出空 → 两个差集都为空 → 永远报"双向一致"。
-		# 这一族"命令不存在但退出码 0"的坑本轮已经踩了第四次，一律用 awk 自己做集合运算。
-		pending=$(awk 'NR == FNR { a[$1] = 1; next } !($1 in a) { print $1 }' \
-			"$TMPD/code.mods" "$TMPD/spec.mods" | sort -u | tr '\n' ' ')
-		awk 'NR == FNR { keep[$1] = 1; next } ($1 in keep)' \
-			"$TMPD/code.mods" "$TMPD/spec.exports" > "$TMPD/spec.cmp"
-		missing=$(awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' \
-			"$TMPD/code.exports" "$TMPD/spec.cmp")
-		extra=$(awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' \
-			"$TMPD/spec.cmp" "$TMPD/code.exports")
-		if [ -n "$missing" ]; then
-			nm=$(printf '%s\n' "$missing" | grep -c .)
-			nf7=$((nf7 + nm))
-			D "✗ SPEC 声明了、代码没有（$nm 个）→ 通常删 SPEC 条目，或补实现："
-			printf '%s\n' "$missing" | sed 's/^/      /'
-		fi
-		if [ -n "$extra" ]; then
-			ne=$(printf '%s\n' "$extra" | grep -c .)
-			nf7=$((nf7 + ne))
-			D "✗ 代码导出了、SPEC 没登记（$ne 个）→ 通常补 SPEC 导出列（先确认它有消费者）："
-			printf '%s\n' "$extra" | sed 's/^/      /'
-		fi
-		[ -n "${pending:-}" ] && D "未实现的模块（本轮不比导出）：$pending"
-		if [ "$nf7" = 0 ]; then
-			P "$G7" "$(wc -l < "$TMPD/code.exports" | tr -d ' ') 个导出与 SPEC §3.2 双向一致"
-		else
-			F "$G7" "$nf7 处导出与 SPEC §3.2 不符（双向比对）"
 		fi
 	fi
 fi
@@ -933,7 +856,7 @@ fi
 # grep -c 双零（恒真）、G5/G6 被定义两次（同一门禁跑两遍，结论行 8 PASS 而真实 6 PASS）。
 # 每次都是人肉发现的。这条检查把"每个标签恰好出现一次"变成机器判据。
 # ============================================================================
-LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G7|$G8|$G9|$S1"
+LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G8|$G9|$S1"   # A4 已移出到 gates_local.sh
 ntag=0; ntagbad=0
 oldifs=$IFS; IFS='|'
 for lbl in $LABELS; do
@@ -950,13 +873,12 @@ for lbl in $LABELS; do
 done
 IFS=$oldifs
 if [ "$ntagbad" = 0 ]; then
-	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（含 A4/A5/A6/S1）\n' "$ntag"
+	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（A1–A3/A5/A6/S1；A4 见 gates_local.sh）\n' "$ntag"
 else
 	printf 'FAIL  [标签自检] %d/%d 个标签计数异常 —— 结论行的数字不可信\n' "$ntagbad" "$ntag"
 fi
-if grep -qF "SKIP  [$G7]" "$TMPD/out.log" 2>/dev/null; then
-	printf '      本地门禁 A4 未在 CI 执行（无 SPEC.md）；发版前必须 SPEC=… --strict 跑一次\n'
-fi
+# A4（导出列一致性）已移到 test/gates_local.sh：它需要仓库外的 SPEC.md，CI 拿不到。
+# 调度由 test/unit/run_all.sh 负责——它会自动探测 SPEC，找不到时在结论区单独打一行提示。
 
 # ============================================================================
 # 结论

@@ -101,10 +101,9 @@ combos() {
 }
 
 # show_diff <a> <b> —— 失败时给前 20 行差异（无 diff 命令时退化为逐行比）
+# N33：不用 diff（设备上没有，`diff && echo` 的 echo 永不执行）。统一用 awk 逐行比。
 show_diff() {
-	if command -v diff >/dev/null 2>&1; then
-		diff -u "$1" "$2" 2>&1 | head -20
-	else
+	if false; then :; else
 		awk 'NR==FNR{a[FNR]=$0; n=FNR; next}
 		     FNR<=n && a[FNR]!=$0 {printf "- %s\n+ %s\n", a[FNR], $0; c++; if (c>=20) exit}
 		     FNR>n && c<20 {printf "+ %s\n", $0; c++}' "$1" "$2"
