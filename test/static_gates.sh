@@ -145,6 +145,25 @@ check_known_entries() {   # $1=门禁标签
 	return 0
 }
 
+strip_comments() {
+	awk '
+		BEGIN { inb = 0 }
+		{
+			line = $0; out = ""; i = 1
+			while (i <= length(line)) {
+				if (inb) {
+					p = index(substr(line, i), "*/")
+					if (p == 0) { i = length(line) + 1; break }
+					i = i + p + 1; inb = 0; continue
+				}
+				if (substr(line, i, 2) == "/*") { inb = 1; i += 2; continue }
+				if (substr(line, i, 2) == "//") break
+				out = out substr(line, i, 1); i++
+			}
+			print out
+		}' "$1"
+}
+
 # ============================================================================
 # G0 元检查 —— 每条门禁必须证明自己"会红"也"会绿"（SPEC §8.6 表格第一行）
 #
@@ -510,6 +529,9 @@ else
 			strip_comments "$uf" > "$TMPD/g4/$(basename "$uf")" 2>/dev/null
 		done
 		find "$SRC" -type f ! -name '*.uc' > "$TMPD/g4/others.list" 2>/dev/null || :
+		# 守卫数据：如果所有剥注释后的文件都是空的，说明剥离本身坏了（函数未定义/正则错），
+		# 此时每个 export 都会被判成"仅测试引用"——那是门禁失效，不是代码有问题。
+		g4bytes=$(cat "$TMPD/g4"/*.uc 2>/dev/null | wc -c | tr -d ' ')
 		while IFS='|' read -r def name; do
 			[ -n "$name" ] || continue
 			# 注意必须排除"定义文件自己的剥注释副本"，否则每个 export 都会被自己的
@@ -532,7 +554,9 @@ else
 			fi
 		done < "$TMPD/g4.exp"
 		no=$(wc -l < "$TMPD/g4.orph" | tr -d ' ')
-		if [ "$no" = 0 ]; then
+		if [ "${g4bytes:-0}" = 0 ]; then
+			F "$G4" "剥注释后所有模块为空 → 门禁自身失效（N37②），不许当作通过"
+		elif [ "$no" = 0 ]; then
 			P "$G4" "$ntot 个 export 都有消费者"
 		else
 			F "$G4" "$no/$ntot 个 export 是孤儿"
@@ -719,24 +743,6 @@ G8="A5 单一 uci 入口"
 # 这种**注释**会把自己判违规——而"注释里提到被禁 API"恰恰是最自然的写法。
 # 已知局限：字符串里的 `//`（如 "http://x"）会被当注释起点，可能漏掉后面的匹配。宁可漏判
 # 也不要假红——假红会让人直接关掉这条门禁。
-strip_comments() {
-	awk '
-		BEGIN { inb = 0 }
-		{
-			line = $0; out = ""; i = 1
-			while (i <= length(line)) {
-				if (inb) {
-					p = index(substr(line, i), "*/")
-					if (p == 0) { i = length(line) + 1; break }
-					i = i + p + 1; inb = 0; continue
-				}
-				if (substr(line, i, 2) == "/*") { inb = 1; i += 2; continue }
-				if (substr(line, i, 2) == "//") break
-				out = out substr(line, i, 1); i++
-			}
-			print out
-		}' "$1"
-}
 
 if [ ! -d "$MODDIR" ]; then
 	S "$G8" "模块目录不存在"
