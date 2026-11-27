@@ -851,6 +851,45 @@ else
 fi
 
 # ============================================================================
+# A7 main 收尾形态（SPEC §8.6，两条同时成立否则红）
+#
+# ① 必须有 `exit(main(ARGV))`（允许缩进）
+# ② **不得**有 `return main(ARGV)` —— 关键：实测 `return main(ARGV);` 之后再写
+#    `exit(main(ARGV));` 会 **rc=0**（return 先生效，exit 成死代码）。
+#    所以"只查有没有 exit"会绿，而真实退出码被清零。
+#
+# 注释过滤用 strip_comments（只认 `//` 与 `/* */`）。ucode 里 `#` **不是注释**
+#  （会 Unexpected character），所以绝不能把 `#` 当注释行跳过；strip_comments 本就不处理 `#`。
+# 比 SPEC 里 `grep -vE '^[[:space:]]*//'` 更准：块注释里提到 `return main` 也不会误报。
+# ============================================================================
+G11="A7 main 收尾形态"
+MAIN_UC="$MODDIR/main.uc"
+if [ ! -f "$MAIN_UC" ]; then
+	S "$G11" "main.uc 未交付（P5）；A7 无从校验（--strict 下转 FAIL）"
+else
+	strip_comments "$MAIN_UC" > "$TMPD/a7.code" 2>/dev/null
+	if [ ! -s "$TMPD/a7.code" ]; then
+		F "$G11" "剥注释后为空 → 门禁自身失效（N37②），不许当作通过"
+	else
+		nf11=0
+		if ! grep -qE '^[[:space:]]*exit\([[:space:]]*main\([[:space:]]*ARGV[[:space:]]*\)\)' "$TMPD/a7.code"; then
+			nf11=$((nf11 + 1))
+			D "✗ 缺 exit(main(ARGV))：进程退出码传不出去"
+		fi
+		if grep -qE 'return[[:space:]]+main\([[:space:]]*ARGV' "$TMPD/a7.code"; then
+			nf11=$((nf11 + 1))
+			D "✗ 出现 return main(ARGV)：实测它让 rc=0，后面的 exit 成死代码"
+			grep -nE 'return[[:space:]]+main\(' "$TMPD/a7.code" | sed 's/^/      /'
+		fi
+		if [ "$nf11" = 0 ]; then
+			P "$G11" "exit(main(ARGV)) 在、且无 return main(ARGV)"
+		else
+			F "$G11" "$nf11 处收尾形态问题"
+		fi
+	fi
+fi
+
+# ============================================================================
 # A8 rpcd 对象零 import（SPEC §8.6；I4 的落点）
 #
 # 为什么 B 段挡不住：B 段（`ucode -c`）只判"能不能编译"。rpcd 对象 import 了模块
@@ -931,7 +970,7 @@ fi
 # grep -c 双零（恒真）、G5/G6 被定义两次（同一门禁跑两遍，结论行 8 PASS 而真实 6 PASS）。
 # 每次都是人肉发现的。这条检查把"每个标签恰好出现一次"变成机器判据。
 # ============================================================================
-LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G8|$G9|$G10|$S1"   # A4 已移出到 gates_local.sh
+LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G8|$G9|$G10|$G11|$S1"   # A4 已移出到 gates_local.sh
 ntag=0; ntagbad=0
 oldifs=$IFS; IFS='|'
 for lbl in $LABELS; do
@@ -948,7 +987,7 @@ for lbl in $LABELS; do
 done
 IFS=$oldifs
 if [ "$ntagbad" = 0 ]; then
-	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（A1–A3/A5/A6/A8/S1；A4 见 gates_local.sh）\n' "$ntag"
+	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（A1–A3/A5–A8/S1；A4 见 gates_local.sh）\n' "$ntag"
 else
 	printf 'FAIL  [标签自检] %d/%d 个标签计数异常 —— 结论行的数字不可信\n' "$ntagbad" "$ntag"
 fi

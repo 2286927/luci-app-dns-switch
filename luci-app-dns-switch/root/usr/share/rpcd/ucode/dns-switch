@@ -1,0 +1,69 @@
+#!/usr/bin/ucode
+// rpcd 对象：ubus 通道（**零 import**，与 CLI 进程级耦合）
+//
+// 10 个方法一律 popen('/usr/bin/dns-switch …')，不 import 任何模块。
+// I4 的落点：ubus 是**新增通道**，不是替代 CLI。一旦 import 模块，CLI 与 ubus
+// 就从"一份行为的两个入口"退化成"两份可能各自演化的实现"——症状是行为不一致，
+// 且极难事后定位。
+//
+// 注意本文件名没有 uc 后缀：任何按后缀名的循环都会漏掉它，故由 A8 单独盯三条：
+//   ① 零 import  ② 不出现 uc 文件名  ③ 必须命中 popen('/usr/bin/dns-switch
+
+function call(args) {
+	let p = popen('/usr/bin/dns-switch ' + args, 'r');
+	if (p == null) return { ok: false, code: 'E_INTERNAL', message: '无法执行 dns-switch' };
+	let out = p.read('all');
+	let rc = p.close();
+	return { ok: (rc == 0), code: (rc == 0) ? 'OK' : 'E_INTERNAL', rc: rc, output: out };
+}
+
+let methods = {
+	on: {
+		call: function () { return call('on'); },
+		args: {}
+	},
+	off: {
+		call: function () { return call('off'); },
+		args: {}
+	},
+	status: {
+		call: function () { return call('status'); },
+		args: {}
+	},
+	timeline: {
+		call: function (req) {
+			let n = (req != null && req.args != null && req.args.limit != null) ? req.args.limit : 20;
+			return call('timeline ' + n);
+		},
+		args: { limit: 0 }
+	},
+	snapshot_list: {
+		call: function () { return call('snapshot list'); },
+		args: {}
+	},
+	snapshot_save: {
+		call: function () { return call('snapshot save'); },
+		args: {}
+	},
+	snapshot_restore: {
+		call: function (req) {
+			let id = (req != null && req.args != null && req.args.id != null) ? req.args.id : '';
+			return call('snapshot restore ' + id);
+		},
+		args: { id: '' }
+	},
+	drill: {
+		call: function () { return call('drill'); },
+		args: {}
+	},
+	bundle: {
+		call: function () { return call('bundle'); },
+		args: {}
+	},
+	apply_intent: {
+		call: function () { return call('apply-intent'); },
+		args: {}
+	}
+};
+
+return methods;

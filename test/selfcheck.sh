@@ -195,6 +195,9 @@ inject_a5_cursor() { printf '\nfunction peek() { let c = uci.cursor(); return c;
 RP=luci-app-dns-switch/root/usr/share/rpcd/ucode/dns-switch
 inject_a8_import()  { printf "\nimport { run } from './sh.uc';\n" >> "$RP"; }
 inject_a8_nopopen() { sed -i '/popen(/d' "$RP"; }
+# A7 两个坏样本：① 删掉 exit(main(ARGV)) ② 出现 return main(ARGV)
+inject_a7_noexit() { sed -i '/exit(main(ARGV))/d' "$M/main.uc"; }
+inject_a7_return() { printf 'return main(ARGV);\n' >> "$M/main.uc"; }
 inject_g5_emoji()  { printf '\n// \360\237\216\211\n' >> luci-app-dns-switch/htdocs/luci-static/resources/view/g0_probe.js; }
 inject_g6_acl()    { sed 's/"version"//; s/, *]/]/' "$A" > "$A.tmp" && mv "$A.tmp" "$A"; }
 
@@ -213,6 +216,8 @@ inject "layers.txt 缺 config 那行"      "3/6" inject_g3_missing
 inject "孤儿 export(无人引用)"        "4/6" inject_g4_orphan
 inject "前端 js 含 🎉"               "5/6" inject_g5_emoji
 inject "state.uc 之外用 cursor("      "A5" inject_a5_cursor
+inject "main.uc 缺 exit(main(ARGV))"  "A7" inject_a7_noexit
+inject "main.uc 出现 return main"     "A7" inject_a7_return
 inject "rpcd 对象里 import 了模块"    "A8" inject_a8_import
 inject "rpcd 对象删掉 popen(空壳)"    "A8" inject_a8_nopopen
 

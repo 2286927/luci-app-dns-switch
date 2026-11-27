@@ -5,6 +5,7 @@ dnsmasq.uc
 fsutil.uc
 lock.uc
 log.uc
+mainlib.uc
 nft.uc
 probe.uc
 sh.uc

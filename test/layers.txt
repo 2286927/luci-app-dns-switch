@@ -5,6 +5,8 @@ dnsmasq.uc L2 state,sh,log
 fsutil.uc L0 fs
 lock.uc L0 fs,fsutil
 log.uc L0 sh,fs
+main.uc L5 mainlib
+mainlib.uc L5 switch,status,snapshot,timeline,bundle
 nft.uc L2 sh,log,fs
 probe.uc L2 config,sh,log,fs
 sh.uc L0 fs
