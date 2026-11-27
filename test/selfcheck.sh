@@ -90,6 +90,8 @@ XMAIN
 	printf '#!/bin/sh\n# G0 样本桩\nexit 0\n' > "$S/root/usr/bin/dns-switch"
 	printf '// ui stub\n' > "$S/htdocs/luci-static/resources/view/g0_probe.js"
 
+	# S1 的数据文件（空清单合法：样本树里没有 ≥250 行的模块）
+	: > "$d/test/size-watch.txt"
 	# 清单由目录推导：样本永远自洽（真实清单的登记责任不在自检里）
 	ls "$MOD"/*.uc 2>/dev/null | sed 's#.*/##' | grep -vx 'main.uc' | sort > "$d/test/modules.txt"
 	# 层图：与上面的 import 一一对应（config→sh），无环
@@ -97,6 +99,16 @@ XMAIN
 sh.uc L0 fs
 config.uc L1 sh
 LAY
+
+	# A4 的数据源：最小 SPEC §3.2 表，必须与上面的 export 一致（sh.run / config.load）
+	# 注意：样本树的 SPEC 放在树外（$T/spec.md），由 run_gate 通过 SPEC= 传给门禁，
+	# 这样"好样本"和"坏样本"共用同一份契约，坏样本只改代码不改契约。
+	cat > "$T/spec.md" <<'SPECMD'
+| 模块 | 层 | 职责 | 对外导出 | 依赖 |
+|---|---|---|---|---|
+| `sh.uc` | L0 | 命令执行 | `run(cmd)` | fs |
+| `config.uc` | L1 | 配置读写 | `load()` | sh |
+SPECMD
 
 	cat > "$S/root/usr/share/rpcd/acl.d/luci-app-dns-switch.json" <<'ACL'
 {
@@ -111,7 +123,7 @@ ACL
 
 # 跑一次门禁，结果进 $1，返回 FAIL 数（解析结论行）
 run_gate() {   # $1=源码根 $2=输出文件
-	sh "$GATE" --src "$1" --no-g0 > "$2" 2>&1
+	SPEC="${SPEC_OVERRIDE:-}" sh "$GATE" --src "$1" --no-g0 > "$2" 2>&1
 	sed -n 's/.*PASS \/ \([0-9]*\) FAIL.*/\1/p' "$2" | tail -1
 }
 
@@ -125,6 +137,8 @@ echo "== G0 元检查：每条门禁 1 好样本 + 1 坏样本 =="
 
 # ---- 好样本：必须一条都不红 ----
 build_good "$T/good"
+SPEC_OVERRIDE="$T/spec.md"
+export SPEC_OVERRIDE
 nf=$(run_gate "$T/good" "$T/good.log")
 if [ "$nf" = 0 ]; then
 	ok "好样本：6 条门禁全过（无 FAIL）"
@@ -166,6 +180,10 @@ inject_g3_cycle()  { printf "\nimport { load } from './config.uc';\n" >> "$M/sh.
 # 清单缺行：删掉 config 的层号声明
 inject_g3_missing(){ sed -i '/^config.uc /d' test/layers.txt; }
 inject_g4_orphan() { printf '\nexport function orphan_probe_fn() { return 1; }\n' >> "$M/lock.uc"; }
+# A4：代码多一个 export，SPEC 没登记（人工往样本树里加）
+inject_a4_export() { printf '\nexport function unlisted_fn() { return 1; }\n' >> "$M/sh.uc"; }
+# A5：state.uc 之外用 cursor(
+inject_a5_cursor() { printf '\nfunction peek() { let c = uci.cursor(); return c; }\n' >> "$M/config.uc"; }
 inject_g5_emoji()  { printf '\n// \360\237\216\211\n' >> luci-app-dns-switch/htdocs/luci-static/resources/view/g0_probe.js; }
 inject_g6_acl()    { sed 's/"version"//; s/, *]/]/' "$A" > "$A.tmp" && mv "$A.tmp" "$A"; }
 
@@ -183,6 +201,8 @@ inject "依赖成环(sh ⇄ config)"          "3/6" inject_g3_cycle
 inject "layers.txt 缺 config 那行"      "3/6" inject_g3_missing
 inject "孤儿 export(无人引用)"        "4/6" inject_g4_orphan
 inject "前端 js 含 🎉"               "5/6" inject_g5_emoji
+inject "代码多一个 SPEC 没登记的导出"  "A4" inject_a4_export
+inject "state.uc 之外用 cursor("      "A5" inject_a5_cursor
 inject "ACL 缺 version"              "6/6" inject_g6_acl
 
 echo

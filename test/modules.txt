@@ -9,4 +9,5 @@ probe.uc
 sh.uc
 snapshot.uc
 state.uc
+status.uc
 timeline.uc

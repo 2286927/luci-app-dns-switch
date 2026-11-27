@@ -288,10 +288,10 @@ if [ "$nfail" -ne 0 ]; then
 fi
 
 if [ "$HAVE_UC" = 0 ]; then
-	say "== 结论：SKIP nft.uc not implemented (P3) —— ① 4/4 通过，② 未执行 =="
+	say "== 结论：SKIP nft.uc not implemented (P3) —— ① $npass/$npass 通过，② 未执行 =="
 	say "   提醒：SKIP 不等于通过。nft.uc 落地后必须重跑，且 CI 不得保留这个 SKIP 分支当作绿灯。"
 	exit 0
 fi
 
-say "== 结论：PASS  4/4 组合逐字节一致 =="
+say "== 结论：PASS  $npass/$npass 组合逐字节一致（4 组默认 ADH + 1 组 adh=10.0.0.1） =="
 exit 0

@@ -75,10 +75,14 @@ TMPD="$TMPBASE/static_gates.$$"
 trap 'rm -rf "$TMPD"' 0 2 15
 mkdir -p "$TMPD" || { echo "ERROR 建不了临时目录 $TMPD"; exit 2; }
 
-P() { NP=$((NP + 1)); printf 'PASS  [%s] %s\n' "$1" "$2"; }
-F() { NF=$((NF + 1)); printf 'FAIL  [%s] %s\n' "$1" "$2"; }
-S() { NS=$((NS + 1)); printf 'SKIP  [%s] %s\n' "$1" "$2"; }
-W() { NW=$((NW + 1)); printf 'WARN  [%s] %s\n' "$1" "$2"; }
+# 所有结论行同时写一份日志：末尾要拿它做"每个标签恰好出现一次"的自检。
+# 为什么需要：曾出现 G5/G6 被定义两次 → 同一条门禁跑两遍 → 结论行 8 PASS 而真实是 6 PASS。
+# **门禁自己的输出也要被校验**，否则"多一行/少一行"只能靠人肉发现（本轮已栽三次）。
+: > "$TMPD/out.log"
+P() { NP=$((NP + 1)); _l=$(printf 'PASS  [%s] %s' "$1" "$2"); printf '%s\n' "$_l"; printf '%s\n' "$_l" >> "$TMPD/out.log"; }
+F() { NF=$((NF + 1)); _l=$(printf 'FAIL  [%s] %s' "$1" "$2"); printf '%s\n' "$_l"; printf '%s\n' "$_l" >> "$TMPD/out.log"; }
+S() { NS=$((NS + 1)); _l=$(printf 'SKIP  [%s] %s' "$1" "$2"); printf '%s\n' "$_l"; printf '%s\n' "$_l" >> "$TMPD/out.log"; }
+W() { NW=$((NW + 1)); _l=$(printf 'WARN  [%s] %s' "$1" "$2"); printf '%s\n' "$_l"; printf '%s\n' "$_l" >> "$TMPD/out.log"; }
 D() { printf '        %s\n' "$*"; }        # 明细行
 
 [ -d "$SRC" ] || { echo "ERROR 找不到包源码：$SRC"; exit 2; }
@@ -156,6 +160,32 @@ check_known_entries() {   # $1=门禁标签
 	fi
 	return 0
 }
+
+# ============================================================================
+# G0 元检查 —— 每条门禁必须证明自己"会红"也"会绿"（SPEC §8.6 表格第一行）
+#
+# 为什么放最前面：本轮连续踩到"门禁自己坏了却报通过"——`ucode -c` 全 255、
+# `grep -P` 设备没有、`od` 缺失扫 0 字节判 PASS、`comm` 缺失让差集变空、
+# `grep -c || echo 0` 恒真、G5/G6 被定义两次导致计数虚高。人肉抓不住这一族，
+# 只能让机器每天自检：好样本不红（防永远红），坏样本必红（防永远绿）。
+# 自检脚本退出码：0 全部成对通过 / 3 有门禁缺样本（比如本机没 ucode）/ 1 有缺陷
+# ============================================================================
+G0="G0 元检查"
+if [ "$RUN_G0" = 0 ]; then
+	S "$G0" "已用 --no-g0 跳过"
+elif [ ! -f "$HERE/selfcheck.sh" ]; then
+	F "$G0" "缺 test/selfcheck.sh —— 没有自检的门禁不算门禁"
+else
+	sh "$HERE/selfcheck.sh" --src "$PKG" > "$TMPD/g0.log" 2>&1
+	g0rc=$?
+	case "$g0rc" in
+		0) P "$G0" "各条门禁成对自检通过（好样本不红、坏样本必红）" ;;
+		3) S "$G0" "有门禁缺自检样本（本机缺工具？见下）"
+		   sed 's/^/        /' "$TMPD/g0.log" | grep -E 'SKIP|缺' | head -6 ;;
+		*) F "$G0" "自检失败：有门禁该红时不红，或好样本被误判"
+		   sed 's/^/        /' "$TMPD/g0.log" | tail -20 ;;
+	esac
+fi
 
 # ============================================================================
 # 1/6 模块语法 —— 三段式（A1 清单一致性 / A2 模块编译 / B 程序式文件）
@@ -378,9 +408,9 @@ else
 		nf3=$((nf3 + 1))
 		D "✗ layers.txt 的模块集合与实盘 *.uc 不一致（新模块必须登记层号）"
 		D "  只在代码里、没登记层号："
-		comm -23 "$TMPD/l.have" "$TMPD/l.decl.s" 2>/dev/null | sed 's/^/    /'
+		awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' "$TMPD/l.decl.s" "$TMPD/l.have" | sed 's/^/    /'
 		D "  只在 layers.txt 里、代码里没有："
-		comm -13 "$TMPD/l.have" "$TMPD/l.decl.s" 2>/dev/null | sed 's/^/    /'
+		awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' "$TMPD/l.have" "$TMPD/l.decl.s" | sed 's/^/    /'
 	fi
 
 	# ---- ② 跨层方向 ----
@@ -673,14 +703,17 @@ else
 fi
 
 # ============================================================================
-# A4 导出列一致性（SPEC §3.2「对外导出」列 ↔ 各模块 ^export 名单）
+# A4 导出列一致性（SPEC §3.2「对外导出」列 ↔ 各模块 ^export 名单）—— 双向
 #
-# **必须双向**：只查"SPEC 声明的都有实现"会漏掉反方向。这次真实漂移恰恰是
-# "SPEC 少写了三个"（声明 set(k,v)，实际是 open/get/set_status/commit）——
-# 单向比对查不出来。两边的差集都要报。
+# **必须双向**：只查"SPEC 声明的都有实现"会漏掉反方向——真实漂移恰恰是
+# "SPEC 少写了"（声明 `set(k,v)`，实际是 open/get/set_status/commit）。
 #
-# 数据源是仓库外的 SPEC.md（CI 里通常没有），所以：找到就比，找不到就 **SKIP 并点名**，
-# 绝不当成通过。用 SPEC=/path/to/SPEC.md 显式指定。
+# SPEC 表格是手写散文，解析规则单独放在 test/audit_exports.awk（可单独跑、单独验）。
+# 三个坑都在那个文件头部写明：反引号内的竖线会截断整行、括号注释里会提到非导出名、
+# 斜杠组只取到第一个。
+#
+# SPEC 在仓库外，CI 里通常没有 → 找不到就 **SKIP 并点名**，绝不当通过。
+# 显式指定：SPEC=/path/to/SPEC.md sh test/static_gates.sh
 # ============================================================================
 G7="A4 导出列一致性"
 SPEC="${SPEC:-}"
@@ -691,43 +724,49 @@ if [ -z "$SPEC" ]; then
 fi
 if [ ! -d "$MODDIR" ]; then
 	S "$G7" "模块目录不存在"
+elif [ ! -f "$HERE/audit_exports.awk" ]; then
+	F "$G7" "缺 test/audit_exports.awk（解析器不在，这条门禁无从校验）"
 elif [ -z "$SPEC" ] || [ ! -f "$SPEC" ]; then
 	S "$G7" "找不到 SPEC.md → 无法比对外导出（设 SPEC=/path/to/SPEC.md 后本门禁才生效）"
 else
-	# 解析 §3.2 表：第 2 列模块、第 5 列导出；取反引号后紧跟的标识符（剥掉 (参数)）
-	awk '
-		/^\|/ {
-			n = split($0, a, "|")
-			if (n < 6) next
-			mod = a[2]; gsub(/[`\t ]/, "", mod); sub(/\.uc$/, "", mod)
-			if (mod !~ /^[a-z_]+$/) next
-			exp = a[5]
-			while (match(exp, /`[A-Za-z_][A-Za-z0-9_]*/)) {
-				print mod " " substr(exp, RSTART + 1, RLENGTH - 1)
-				exp = substr(exp, RSTART + RLENGTH)
-			}
-		}' "$SPEC" | sort -u > "$TMPD/spec.exports"
-
+	awk -f "$HERE/audit_exports.awk" "$SPEC" | sort -u > "$TMPD/spec.exports"
 	awk '/^export (function|const|let) /{
 			n = $3; sub(/[(].*/, "", n); printf "%s %s\n", FILENAME, n
-		}' "$MODDIR"/*.uc 2>/dev/null | sed 's#.*/dns-switch/##; s#\.uc # #' | sort -u > "$TMPD/code.exports"
+		}' "$MODDIR"/*.uc 2>/dev/null \
+		| sed 's#.*/dns-switch/##; s#[.]uc # #' | sort -u > "$TMPD/code.exports"
 
 	if [ ! -s "$TMPD/spec.exports" ]; then
-		S "$G7" "SPEC 里解析不出 §3.2 的导出列（表结构变了？）"
+		S "$G7" "SPEC 里解析不出 §3.2 的导出列（表结构变了？先修门禁，不许当作通过）"
+	elif [ ! -s "$TMPD/code.exports" ]; then
+		S "$G7" "代码里没有任何 export（模块还没写？）"
 	else
 		nf7=0
-		missing=$(comm -23 "$TMPD/spec.exports" "$TMPD/code.exports" 2>/dev/null)
-		extra=$(comm -13 "$TMPD/spec.exports" "$TMPD/code.exports" 2>/dev/null)
+		awk '{print $1}' "$TMPD/code.exports" | sort -u > "$TMPD/code.mods"
+		awk '{print $1}' "$TMPD/spec.exports" | sort -u > "$TMPD/spec.mods"
+		# 注意：**不要用 comm**。r68s 上没有 comm（和 diff / od 一样没编进 busybox），
+		# 缺了它 `$(comm ...)` 静默输出空 → 两个差集都为空 → 永远报"双向一致"。
+		# 这一族"命令不存在但退出码 0"的坑本轮已经踩了第四次，一律用 awk 自己做集合运算。
+		pending=$(awk 'NR == FNR { a[$1] = 1; next } !($1 in a) { print $1 }' \
+			"$TMPD/code.mods" "$TMPD/spec.mods" | sort -u | tr '\n' ' ')
+		awk 'NR == FNR { keep[$1] = 1; next } ($1 in keep)' \
+			"$TMPD/code.mods" "$TMPD/spec.exports" > "$TMPD/spec.cmp"
+		missing=$(awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' \
+			"$TMPD/code.exports" "$TMPD/spec.cmp")
+		extra=$(awk 'NR == FNR { a[$0] = 1; next } !($0 in a)' \
+			"$TMPD/spec.cmp" "$TMPD/code.exports")
 		if [ -n "$missing" ]; then
-			nf7=$((nf7 + $(printf '%s\n' "$missing" | grep -c .)))
-			D "✗ SPEC 声明了但代码没有："
-			printf '%s\n' "$missing" | sed 's/^/    /'
+			nm=$(printf '%s\n' "$missing" | grep -c .)
+			nf7=$((nf7 + nm))
+			D "✗ SPEC 声明了、代码没有（$nm 个）→ 通常删 SPEC 条目，或补实现："
+			printf '%s\n' "$missing" | sed 's/^/      /'
 		fi
 		if [ -n "$extra" ]; then
-			nf7=$((nf7 + $(printf '%s\n' "$extra" | grep -c .)))
-			D "✗ 代码导出了但 SPEC 没登记："
-			printf '%s\n' "$extra" | sed 's/^/    /'
+			ne=$(printf '%s\n' "$extra" | grep -c .)
+			nf7=$((nf7 + ne))
+			D "✗ 代码导出了、SPEC 没登记（$ne 个）→ 通常补 SPEC 导出列（先确认它有消费者）："
+			printf '%s\n' "$extra" | sed 's/^/      /'
 		fi
+		[ -n "${pending:-}" ] && D "未实现的模块（本轮不比导出）：$pending"
 		if [ "$nf7" = 0 ]; then
 			P "$G7" "$(wc -l < "$TMPD/code.exports" | tr -d ' ') 个导出与 SPEC §3.2 双向一致"
 		else
@@ -739,41 +778,64 @@ fi
 # ============================================================================
 # A5 单一 uci 入口：`cursor(` 只许出现在 state.uc
 #
-# 为什么要管：cursor 是"读 uci 的那扇门"。门开了好几扇，写路径就会分叉，
-# 于是"配置改了但状态没跟上"这类问题会到处冒头。只留一扇门，排查时永远只有一个地方。
+# 为什么要管：cursor 是"读 uci 的那扇门"。门开了好几扇，写路径就分叉，
+# "配置改了但状态没跟上"这类问题会到处冒头。只留一扇门，排查时永远只有一个地方。
 #
-# 假红的两个来源，必须处理掉，否则这条会被人直接关掉：
-#   ① 注释里出现 cursor(   → 跳过行首为 * / // / # 的行
-#   ② 字符串里提到 cursor( → 数一下匹配点之前的双引号个数，奇数说明在字符串里
-#   ③ state.uc 自己当然要命中，不能把自己判违规
+# 两个假红来源必须处理，否则这条会被人直接关掉：
+#   ① 注释里出现 cursor( → 跳过行首为 * / // / # 的行
+#   ② 字符串里提到 cursor( → 数匹配点之前的双引号个数，奇数说明在字符串里
+#   ③ state.uc 自己当然要命中，不判它违规
 # ============================================================================
 G8="A5 单一 uci 入口"
+
+# 剥注释：`//` 到行尾、`/* */` 跨行。必须在匹配前剥，否则「本模块不许自己开 cursor()」
+# 这种**注释**会把自己判违规——而"注释里提到被禁 API"恰恰是最自然的写法。
+# 已知局限：字符串里的 `//`（如 "http://x"）会被当注释起点，可能漏掉后面的匹配。宁可漏判
+# 也不要假红——假红会让人直接关掉这条门禁。
+strip_comments() {
+	awk '
+		BEGIN { inb = 0 }
+		{
+			line = $0; out = ""; i = 1
+			while (i <= length(line)) {
+				if (inb) {
+					p = index(substr(line, i), "*/")
+					if (p == 0) { i = length(line) + 1; break }
+					i = i + p + 1; inb = 0; continue
+				}
+				if (substr(line, i, 2) == "/*") { inb = 1; i += 2; continue }
+				if (substr(line, i, 2) == "//") break
+				out = out substr(line, i, 1); i++
+			}
+			print out
+		}' "$1"
+}
+
 if [ ! -d "$MODDIR" ]; then
 	S "$G8" "模块目录不存在"
 else
 	: > "$TMPD/a5.hit"
+	na5empty=0
 	for f in "$MODDIR"/*.uc; do
 		[ -f "$f" ] || continue
 		b=$(basename "$f" .uc)
 		[ "$b" = state ] && continue
-		awk -v F="$b" '
-			{
-				if ($0 ~ /^[ \t]*(\*|\/\/|#)/) next
-				pos = 0
-				while ((i = index(substr($0, pos + 1), "cursor(")) > 0) {
-					idx = pos + i
-					pre = substr($0, 1, idx - 1)
-					q = gsub(/"/, "", pre)
-					if (q % 2 == 0) { printf "%s:%d: cursor(\n", F, NR; break }
-					pos = idx
-				}
-			}' "$f" >> "$TMPD/a5.hit"
+		strip_comments "$f" > "$TMPD/a5.stripped"
+		# 剥离后整文件为空 → 剥错了（把代码也当注释吃掉）→ 直接报，不许静默放行
+		if [ -s "$f" ] && [ ! -s "$TMPD/a5.stripped" ]; then
+			na5empty=$((na5empty + 1))
+			D "✗ $b：剥注释后文件为空（剥离逻辑吃掉了全部内容，门禁必须修）"
+			continue
+		fi
+		grep -n 'cursor(' "$TMPD/a5.stripped" 2>/dev/null | sed "s#^#$b:#" >> "$TMPD/a5.hit"
 	done
 	nh5=$(wc -l < "$TMPD/a5.hit" | tr -d ' ')
-	if [ "$nh5" = 0 ]; then
+	if [ "$na5empty" != 0 ]; then
+		F "$G8" "$na5empty 个文件剥注释后为空 —— 门禁自身失效，不许当作通过"
+	elif [ "$nh5" = 0 ]; then
 		if [ -f "$MODDIR/state.uc" ]; then
-			if grep -q 'cursor(' "$MODDIR/state.uc" 2>/dev/null; then
-				P "$G8" "cursor( 只在 state.uc 出现"
+			if strip_comments "$MODDIR/state.uc" | grep -q 'cursor('; then
+				P "$G8" "cursor( 只出现在 state.uc（单一 uci 入口）"
 			else
 				W "$G8" "state.uc 里也没有 cursor( —— 单一入口是不是被绕过了？"
 			fi
@@ -785,6 +847,115 @@ else
 		sed 's/^/        /' "$TMPD/a5.hit"
 		D "  规则：uci 的读入口只留一个，否则写路径分叉、状态与配置对不上"
 	fi
+fi
+
+# ============================================================================
+# A6 内建依赖单向（代码用了 fs/uci 就必须在 layers.txt 声明）
+#
+# 判据（team-lead 定）：**撒谎必红，多写只提醒**——
+#   代码用了、清单没声明 → FAIL（清单在撒谎，A6 存在的理由就是这个）
+#   清单声明了、代码没用 → WARN（可能是冷路径，强行要求删会逼人删掉日志）
+# ============================================================================
+G9="A6 内建依赖"
+BUILTINS="fs uci"
+if [ ! -d "$MODDIR" ] || [ ! -f "$LAYERS" ]; then
+	S "$G9" "模块目录或 layers.txt 不存在"
+else
+	nf9=0; nw9=0; ntot9=0
+	while read -r mod lay deps; do
+		[ -n "${mod:-}" ] || continue
+		m=${mod%.uc}
+		f="$MODDIR/$m.uc"
+		[ -f "$f" ] || continue
+		ntot9=$((ntot9 + 1))
+		decl=$(printf '%s' "${deps:-}" | tr ',' ' ')
+		for b in $BUILTINS; do
+			if grep -qE "(^|[^A-Za-z0-9_])$b[.]" "$f" 2>/dev/null \
+				|| grep -q "require('$b')" "$f" 2>/dev/null; then
+				case " $decl " in
+					*" $b "*) : ;;
+					*) nf9=$((nf9 + 1))
+					   D "✗ $m 用了 $b，但 layers.txt 没声明 → 补 $b 到该行依赖列" ;;
+				esac
+			else
+				case " $decl " in
+					*" $b "*) nw9=$((nw9 + 1))
+					   D "· $m 声明了 $b 但代码没用到（冷路径？还是过期声明？）" ;;
+				esac
+			fi
+		done
+	done < "$TMPD/lay.txt"
+	if [ "$nf9" = 0 ]; then
+		P "$G9" "$ntot9 个模块的内建依赖都已在 layers.txt 声明"
+	else
+		F "$G9" "$nf9 处用了没声明"
+	fi
+	[ "$nw9" != 0 ] && W "$G9" "$nw9 处声明了但没用到（可见即可，不阻塞）"
+fi
+
+# ============================================================================
+# S1 行数配额：≥250 行的模块必须登记在 size-watch.txt（U23）
+# 为什么绑行数而不是绑文件名：规则改成绑行数之后，清单本人立刻又漏了 probe——
+# **清单只要没人比对就会漂**，所以清单本身要有门禁。
+# 阈值 250 写在判据里，不进数据文件（数据只管"谁被盯上了"）。
+# ============================================================================
+S1="S1 行数配额"
+SW="$PKG/test/size-watch.txt"
+if [ ! -d "$MODDIR" ]; then
+	S "$S1" "模块目录不存在"
+elif [ ! -f "$SW" ]; then
+	F "$S1" "缺 test/size-watch.txt（清单缺失必须红，不许 SKIP）"
+else
+	# 注意：0 条本身是合法状态（当前没有 ≥250 行的模块）。所以"解析到 0 行"不直接红，
+	# 而是继续比对：真超线了却没人登记，下面的 cmp 一样会红。文件缺失才直接红（上面那条）。
+	nlines=$(grep -vcE '^[[:space:]]*(#|$)' "$SW" 2>/dev/null)
+	nlines=${nlines:-0}
+	if : ; then
+		wc -l "$MODDIR"/*.uc 2>/dev/null | awk '$1 >= 250 && $2 != "total" { print $2 }' \
+			| sed 's#.*/##' | sort > "$TMPD/sw.now"
+		awk '{ print $1 }' "$SW" | grep -vE '^[[:space:]]*(#|$)' | sort > "$TMPD/sw.want"
+		if cmp -s "$TMPD/sw.now" "$TMPD/sw.want"; then
+			P "$S1" "$(wc -l < "$TMPD/sw.now" | tr -d ' ') 个 ≥250 行的模块都已登记"
+		else
+			F "$S1" "≥250 行的模块与 size-watch.txt 不一致（动它之前先拆）"
+			D "  扫描到（实际 ≥250 行）："
+			sed 's/^/      /' "$TMPD/sw.now"
+			D "  清单里（size-watch.txt）："
+			sed 's/^/      /' "$TMPD/sw.want"
+		fi
+	fi
+fi
+
+# ============================================================================
+# 标签计数自检 —— 门禁自己的输出也要被校验
+#
+# 本轮栽过三次"少一行 / 多一行"：od 缺失导致扫描 0 字节（少一行判断）、
+# grep -c 双零（恒真）、G5/G6 被定义两次（同一门禁跑两遍，结论行 8 PASS 而真实 6 PASS）。
+# 每次都是人肉发现的。这条检查把"每个标签恰好出现一次"变成机器判据。
+# ============================================================================
+LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G7|$G8|$G9|$S1"
+ntag=0; ntagbad=0
+oldifs=$IFS; IFS='|'
+for lbl in $LABELS; do
+	ntag=$((ntag + 1))
+	# 只数**结论行**（PASS/FAIL/SKIP）——一个小节允许多条 WARN 明细，
+	# 但结论只能有一个。之前把 WARN 一起数，导致 G1/G4/G5 因为"判决+WARN"被判两次。
+	n=$(grep -cE "^(PASS|FAIL|SKIP)  \[$lbl\]" "$TMPD/out.log" 2>/dev/null)
+	n=${n:-0}
+	if [ "$n" != 1 ]; then
+		ntagbad=$((ntagbad + 1))
+		NF=$((NF + 1))
+		printf 'FAIL  [标签自检] 「%s」的结论行出现 %s 次（应恰好 1 次）\n' "$lbl" "$n"
+	fi
+done
+IFS=$oldifs
+if [ "$ntagbad" = 0 ]; then
+	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（含 A4/A5/A6/S1）\n' "$ntag"
+else
+	printf 'FAIL  [标签自检] %d/%d 个标签计数异常 —— 结论行的数字不可信\n' "$ntagbad" "$ntag"
+fi
+if grep -qF "SKIP  [$G7]" "$TMPD/out.log" 2>/dev/null; then
+	printf '      本地门禁 A4 未在 CI 执行（无 SPEC.md）；发版前必须 SPEC=… --strict 跑一次\n'
 fi
 
 # ============================================================================
