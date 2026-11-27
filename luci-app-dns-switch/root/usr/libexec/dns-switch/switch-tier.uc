@@ -12,12 +12,13 @@
 // 零 import 这件事由 A6（内建依赖）+ G3（依赖图孤立点）两条门禁守着，
 // 谁想加 require('fs') 都会当场红——这是"纯"能被机器验证的唯一形式。
 //
-// 阈值与 v1.0.1 对齐：连续失败 2 次降级、连续成功 2 次回切、冷却 120 s。
+// 阈值**逐值对齐 v1.0.1 dns-switch:48-50**：FAIL_NEED=2 / SUCC_NEED=3 / COOLDOWN=120。
+// 比较语义是 `>=`（原文用 `-ge`）。漂一个值不会报错，只会在真机上表现为早/晚一次探测。
 // ============================================================
 
-const FAIL_N = 2;        // 连续探测失败多少次触发降级
-const SUCC_N = 2;        // 连续成功多少次允许回切
-const COOLDOWN = 120;    // 降级后冷却秒数（期内不再降级/回切）
+const FAIL_N = 2;        // 连续失败几次才降级（v1.0.1:49 FAIL_NEED=2）
+const SUCC_N = 3;        // 连续成功多少次允许回切（v1.0.1 dns-switch:50 SUCC_NEED=3）
+const COOLDOWN = 120;    // 两次迁移之间的冷却秒数（v1.0.1:48）
 
 function opt_of(opts, key, dflt) {
 	if (opts != null && type(opts) == 'object') {
@@ -76,7 +77,7 @@ export function tier_failover(state, cfg) {
 	let streak = opt_of(st, 'fail_streak', 0);
 
 	if (setting(cfg, 'mode') != 'on') return { action: 'skip', why: 'mode 不是 on' };
-	if (eff == 'failover') return { action: 'skip', why: '已经处于降级' };
+	if (eff != 'on') return { action: 'skip', why: sprintf("effective=%s，不是 on（v1.0.1:1662 同口径）", length(eff) ? eff : '空') };
 	if (cooling(st, cfg)) return { action: 'wait', why: '冷却期内' };
 	if (streak < FAIL_N) {
 		return { action: 'wait', why: sprintf('连续失败 %d < %d', streak, FAIL_N) };

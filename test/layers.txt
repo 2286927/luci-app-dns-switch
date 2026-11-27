@@ -12,4 +12,5 @@ snapshot.uc L2 config,nft,log,state,sh,fs
 state.uc L1 uci,log,fs
 status.uc L3 config,conflict,nft,dnsmasq,probe,fs
 switch-tier.uc L4
+tick.uc L4 config,state,switch-tier,dnsmasq,nft,log,fs
 timeline.uc L2 log,sh,fs

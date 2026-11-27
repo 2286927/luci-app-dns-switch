@@ -12,4 +12,5 @@ snapshot.uc
 state.uc
 status.uc
 switch-tier.uc
+tick.uc
 timeline.uc
