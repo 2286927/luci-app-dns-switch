@@ -34,8 +34,8 @@ function opt_of(opts, key, dflt) {
 	return dflt;
 }
 
-// 执行动作：默认真调 dnsmasq；单测传**替身**（recorder）——那段
-// "真切成功后写冷却"的代码仍被执行、被检查。不用开关式缝。
+// 执行动作：默认真调 dnsmasq；单测传**替身**（recorder），"真切成功后写冷却"
+// 那段仍被执行、被检查。不用开关式缝（关掉=把代码从覆盖里删掉）。
 function act_of(opts) {
 	let a = (opts != null && type(opts) == 'object') ? opts.act : null;
 	if (a != null && type(a) == 'object'
@@ -64,8 +64,7 @@ function write_int(opts, name, v) {
 	return fs.writefile(path_of(opts, name), sprintf('%d\n', v)) != null;
 }
 
-// 读运行态 → 组装 tier 需要的 state。只搬运、不判定。**内部函数**：
-// 没有生产消费者，导出会让 A4（契约）与 G4（孤儿）同时报。
+// 读运行态 → 组装 tier 的 state。只搬运不判定；**内部函数**（导出会踩 A4+G4）。
 function read_state(opts) {
 	let eff = state.get_opt('dns_switch', 'status', 'effective');
 	let chain = opt_of(opts, 'chain_exists', null);

@@ -512,14 +512,16 @@ else
 		find "$SRC" -type f ! -name '*.uc' > "$TMPD/g4/others.list" 2>/dev/null || :
 		while IFS='|' read -r def name; do
 			[ -n "$name" ] || continue
-			prod=$(grep -rlw -- "$name" "$TMPD/g4" 2>/dev/null | head -1)
+			# 注意必须排除"定义文件自己的剥注释副本"，否则每个 export 都会被自己的
+			# `export function NAME` 那一行算成消费者 → 全员 PASS 的假绿。
+			prod=$(grep -rlw -- "$name" "$TMPD/g4" 2>/dev/null \
+				| grep -v -F -x -- "$TMPD/g4/$(basename "$def")" | head -1)
 			if [ -z "$prod" ]; then
 				while IFS= read -r of; do
 					[ -f "$of" ] || continue
 					if grep -qw -- "$name" "$of" 2>/dev/null; then prod=$of; break; fi
 				done < "$TMPD/g4/others.list"
 			fi
-			[ -n "$prod" ] || prod=""
 			tst=$(grep -rlw -- "$name" "$PKG/test" 2>/dev/null | grep -v -F -x -- "$def" | head -1)
 			if [ -n "$prod" ]; then
 				:
