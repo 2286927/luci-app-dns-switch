@@ -1,24 +1,34 @@
 'use strict';
 
 // ============================================================
-// config.uc —— L1 配置层：uci 的**唯一**出口
+// config.uc —— L1 配置层：uci 的**唯一对外出口**
 //
 // 承接 v1.0.1 的 s_opt / t_opt / reload_cfg / need_cfg / ensure_config /
 // st_set / st_commit / sig_now。
 //
-// 铁律（SPEC §3.4）：
-//   1. 缺省值只在 load() 里 resolve 一次；其它模块**不许**再写 `?? default`。
-//      opt(k, def) 的 def 只留给表外的键——表内键在 load() 已经填好，
-//      再传 def 只是重复劳动（真要传，说明 §3.4 该加一行）。
-//   2. 配置文件不存在 → 按 v1.0.1 的 ensure_config 逐字节建出来。
-//   3. status 段缺失 → 补建并记日志（uci set 不建命名段，缺了所有
-//      state_set 都是空写，页面和 status 会永远显示上一次的值）。
-//   4. uci commit 失败 → 返回 code=E_UCI_COMMIT，**禁止**静默继续。
+// 分工（P3-DESIGN §1.2 / IMPL-NOTES N23 拆分后）：
+//   state.uc  = 怎么和 uci 说话（cursor、建/修配置、读写、commit）
+//   config.uc = 说什么（§3.4 缺省值 resolve、对外视图、签名）
 //
-// 返回值形状：load() 直接返回已解析对象（SPEC §3.2），对象里额外带
-//   ok / code / message 三个键做错误通道（配置键里没有同名的，不会撞）。
-//   ok=true  → 后续读 cfg.mode 等
-//   ok=false → 只有 code/message/detail，调用方按 E_* 处理
+// **写路径没有别名**：config 只导出 load() / opt() / sig()。
+// 写 status 一律 `state.set_status(k,v)` + `state.commit()`——
+// 曾经在 config 里留过 state_set()/commit() 两个薄壳，被 team-lead 判为
+// "两套写法并存，下次改动只会改一处"，已删。别再补回来。
+//
+// 由此带来一条使用约束：**写完想立刻读，必须重新 load()**。
+// 原因：cfg 是 load() 那一刻的快照，而 state 写的是 uci；
+// 不重新 load() 就读 cfg.status.x 会拿到旧值（v1.0.1 每次 uci get 都是新读，
+// 所以这是拆分新引入的唯一语义差异，写在这里防止后来人踩）。
+//
+// 铁律（SPEC §3.4）：
+//   1. 缺省值**只在这里** resolve 一次；其它模块不许再写 `?? default`。
+//      opt(k, def) 的 def 只留给表外的键——表内键在 load() 已经填好。
+//   2. 配置文件不存在 / status 段缺失的**修复动作**在 state.open() 里，
+//      这里只负责把结果读成对象；任何一步失败都返回 ok:false。
+//   3. uci commit 失败 → code=E_UCI_COMMIT，**禁止**静默继续。
+//
+// 返回值形状：load() 直接返回已解析对象，对象里额外带 ok / code / message
+// 做错误通道（配置键里没有同名的，不会撞）。
 //
 // 数字一律保持 uci 里的**字符串**（"3030" 不是 3030）：
 //   sig() 要与 v1.0.1 的 sig_now 逐字节比对，JSON 侧的数值转换是 status/rpcd 的活。
@@ -26,18 +36,13 @@
 // opts（仅供单测）：load({confdir:"/tmp/x"}) 把 uci 根指到临时目录，
 //   生产调用一律 load() / state_set() / commit() / sig() 不带参数。
 //
-// 依赖：uci + log（不 import 任何上层模块）
+// 依赖：./state.uc（不 import 任何上层模块）
 // ============================================================
 
-import { log, err } from './log.uc';
+import * as state from './state.uc';
 
-let uci = require('uci');
-let fs = require('fs');
-
-const PKG = 'dns_switch';
 const SECT = 'settings';
 const STAT = 'status';
-const CONFDIR = '/etc/config';
 
 // ---- §3.4 缺省值表：全项目唯一的 resolve 点 ----
 const DEFAULTS = {
@@ -66,198 +71,86 @@ const STATUS_KEYS = [
 	'conflict_fix', 'applied_sig'
 ];
 
-// 出厂 payload（逐字节照抄 v1.0.1 ensure_config 的 here-doc）
-const FACTORY = [
-	"",
-	"config settings 'settings'",
-	"\toption mode 'off'",
-	"\toption adh_ip '172.16.1.2'",
-	"\toption adh_port '3030'",
-	"\toption fallback_dns '172.16.5.5'",
-	"\toption fallback_dns6 ''",
-	"\toption probe_domain 'www.baidu.com'",
-	"\toption adh_mac ''",
-	"\toption dot853 'allow'",
-	"\toption upstream_mode 'auto'",
-	"\toption isp_list4 '202.103.224.68 202.103.225.68'",
-	"\toption isp_list6 ''",
-	"\toption auto_failover '1'",
-	"\toption probe_now '0'",
-	"\toption request_at '0'",
-	"",
-	"config status 'status'",
-	"\toption effective 'off'",
-	"\toption probe 'unknown'",
-	"\toption reason 'factory-default'",
-	"\toption dep ''",
-	"\toption adh_mac ''",
-	"\toption upstream ''",
-	"\toption last_change '0'",
-	"\toption error ''",
-	"\toption conflict 'none'",
-	"\toption conflict_by ''",
-	"\toption conflict_msg ''",
-	"\toption conflict_fix ''",
-	""
-];
-
-let cur = null;      // uci cursor
 let cfg = null;      // 最近一次 load() 的已解析对象
-let dirty = false;   // 有没有未提交的 state_set
-
-function confdir_of(opts) {
-	if (opts != null && type(opts) == 'object') {
-		if (type(opts.confdir) == 'string' && length(opts.confdir)) return opts.confdir;
-	}
-	return CONFDIR;
-}
-
-function fail(code, message) {
-	err(message);
-	return { ok: false, code: code, message: message, detail: {} };
-}
-
-function opt_string(k) {
-	let v = cur.get(PKG, SECT, k);
-	return (type(v) == 'string') ? v : null;
-}
 
 function resolve(k) {
-	let v = opt_string(k);
+	let v = state.get(SECT, k);
 	if (v == null || !length(v)) return DEFAULTS[k];   // 对应 shell 的 ${X:-default}
 	return v;
 }
 
-// 建出厂配置：写文件 → 让 cursor 重读 → commit（与 v1.0.1 的顺序一致）
-function ensure_config(dir) {
-	let path = dir + '/' + PKG;
-	let n = fs.writefile(path, join('\n', FACTORY));
-	if (n == null) {
-		return fail('E_UCI_COMMIT', sprintf('无法写入 %s（配置未落盘）', path));
-	}
-
-	let loaded = false;
-	try {
-		loaded = (cur.load(PKG) === true);
-	} catch (e) {
-		loaded = false;
-	}
-	if (!loaded) return fail('E_INTERNAL', sprintf('uci 无法解析刚建好的 %s', path));
-
-	if (cur.commit(PKG) !== true) {
-		return fail('E_UCI_COMMIT', 'uci commit dns_switch 失败，出厂配置未落盘');
-	}
-	log('初始化 dns_switch 配置');
-	return { ok: true, code: 'OK', message: '' };
-}
-
-function ensure_status() {
-	let sect = cur.get(PKG, STAT);
-	if (type(sect) == 'string' && length(sect)) return { ok: true, code: 'OK', message: '' };
-
-	if (cur.set(PKG, STAT, STAT) !== true) {
-		return fail('E_UCI_COMMIT', 'uci set dns_switch.status=status 失败');
-	}
-	if (cur.commit(PKG) !== true) {
-		return fail('E_UCI_COMMIT', 'uci commit dns_switch 失败，status 段未补建');
-	}
-	log('补建 status 段');
-	return { ok: true, code: 'OK', message: '' };
-}
-
 /**
- * 读 + 修 + resolve，返回已解析配置对象。
- * 返回对象恒有 ok / code / message；ok=false 时不要继续用其它键。
+ * 方案 B（SPEC §3.4 / DECISIONS U13）：失败也返回**完整骨架**。
+ *
+ * 为什么：原来失败只返回 {ok,code,message,detail}，没有 settings/status；
+ * 调用方漏判 ok 时 `cfg.status.effective` 就是**对 null 取字段 → 进程崩溃**，
+ * rc=254。254 不在 §4.2 的 0/1/2/3/4/75 里，脚本侧完全看不懂。
+ *
+ * 骨架值用**空哨兵**不用 null（N2：type(null) 返回 null 本身，判不出来）：
+ *   字符串 ''、数值 0。last_change 是唯一的数值字段，给 0。
+ *
+ * 代价（N24 纪律）：骨架只解决"不崩"，不解决"可信"。settings/status 恒存在
+ * ⇒ `if (cfg.status)` 这类存在性判断**恒真**，等于没有判断。
+ * 所有消费方必须先查 cfg.ok，再映射 §4.2 的 E_*。
  */
-export function load(opts) {
-	let dir = confdir_of(opts);
-	let path = dir + '/' + PKG;
-
-	try {
-		cur = (dir == CONFDIR) ? uci.cursor() : uci.cursor(dir);
-	} catch (e) {
-		cur = null;
-		return fail('E_INTERNAL', sprintf('无法打开 uci：%s', e));
-	}
-	dirty = false;
-
-	if (fs.stat(path) == null) {
-		let created = ensure_config(dir);
-		if (!created.ok) return created;
-	}
-
-	let fixed = ensure_status();
-	if (!fixed.ok) return fixed;
-
-	let out = {};
+function skeleton(code, message, detail) {
+	let out = { ok: false, code: code, message: message, detail: detail };
+	let s = {};
+	let t = {};
 	let k;
-	for (k in DEFAULTS) out[k] = resolve(k);
 
-	out.status = {};
-	for (let i = 0; i < length(STATUS_KEYS); i++) {
-		let key = STATUS_KEYS[i];
-		let v = cur.get(PKG, STAT, key);
-		out.status[key] = (type(v) == 'string') ? v : '';
-	}
+	for (k in DEFAULTS) s[k] = '';
+	for (let i = 0; i < length(STATUS_KEYS); i++) t[STATUS_KEYS[i]] = '';
+	t.last_change = 0;          // 唯一数值字段，按契约给 0 而不是 ''
 
-	out.ok = true;
-	out.code = 'OK';
-	out.message = '';
-	cfg = out;
+	out.settings = s;
+	out.status = t;
 	return out;
 }
 
 /**
- * 取一个配置键。§3.4 表内的键在 load() 已 resolve，def 只对表外的键有意义。
+ * 读 + resolve，返回已解析配置对象：
+ *   { ok:true,  code:'OK', message:'', detail:{}, settings:{…}, status:{…} }
+ *   { ok:false, code:'E_*', message, detail,    settings:{…空哨兵}, status:{…空哨兵} }
+ * **ok=false 时字段值不可信**，只代表"形状完整、不会崩"。
+ */
+export function load(opts) {
+	let opened = state.open(opts);
+	if (!opened.ok) {
+		cfg = skeleton(opened.code, opened.message,
+			(type(opened.detail) == 'object' && opened.detail != null) ? opened.detail : {});
+		return cfg;
+	}
+
+	let settings = {};
+	let k;
+	for (k in DEFAULTS) settings[k] = resolve(k);
+
+	let status = {};
+	for (let i = 0; i < length(STATUS_KEYS); i++) {
+		let key = STATUS_KEYS[i];
+		let v = state.get(STAT, key);
+		status[key] = (v != null) ? v : '';
+	}
+
+	cfg = { ok: true, code: 'OK', message: '', detail: {} };
+	cfg.settings = settings;
+	cfg.status = status;
+	return cfg;
+}
+
+/**
+ * 取一个配置键（读 settings 段）。§3.4 表内的键在 load() 已 resolve，
+ * def 只对表外的键有意义。
  * 判空用 `=== null`：实测 ucode 的 type(null) 返回 null 本身，不是 "null"。
+ * 注意：ok=false 时拿到的是空哨兵，**看起来像"值为空"而不是"读不到"**，
+ *       所以消费方必须先查 cfg.ok（N24），别靠这里的返回值判断配置是否可读。
  */
 export function opt(k, def) {
 	if (cfg == null) return def;
-	let v = cfg[k];
+	let v = cfg.settings[k];
 	if (v === null) return def;
 	return v;
-}
-
-/**
- * 写 status 段的一个字段（不 commit）。值没变就不写——v1.0.1 的
- * st_set 靠这一条少写 flash。返回 true=已是目标值。
- */
-export function state_set(k, v) {
-	if (cur == null || cfg == null) return false;
-
-	let val = '';
-	if (type(v) == 'string') val = v;
-	else if (v !== null) val = "" + v;      // type(null) 是 null，不能拿它判空
-
-	let old = cur.get(PKG, STAT, k);
-	if (type(old) == 'string' && old == val) return true;
-
-	if (cur.set(PKG, STAT, k, val) !== true) return false;
-	cfg.status[k] = val;
-	dirty = true;
-	return true;
-}
-
-/**
- * 提交 status 段的改动。没有未提交改动时是空操作（不碰 flash）。
- * 失败返回 E_UCI_COMMIT（CLI 侧对应 rc=4）。
- */
-export function commit() {
-	if (cur == null) {
-		return { ok: false, code: 'E_INTERNAL', message: 'commit 前必须先成功 load()', detail: {} };
-	}
-	if (!dirty) return { ok: true, code: 'OK', message: '' };
-
-	if (cur.commit(PKG) !== true) {
-		err('uci commit dns_switch 失败，状态未落盘');
-		return {
-			ok: false, code: 'E_UCI_COMMIT',
-			message: 'uci commit dns_switch 失败，状态未落盘',
-			detail: {}
-		};
-	}
-	dirty = false;
-	return { ok: true, code: 'OK', message: '' };
 }
 
 /**
@@ -267,7 +160,8 @@ export function commit() {
  */
 export function sig() {
 	if (cfg == null || cfg.ok != true) return '';
+	let s = cfg.settings;
 	return sprintf('%s|%s|%s|%s|%s|%s|%s|%s|%s',
-		cfg.adh_ip, cfg.adh_port, cfg.fallback_dns, cfg.fallback_dns6,
-		cfg.dot853, cfg.adh_mac, cfg.upstream_mode, cfg.isp_list4, cfg.isp_list6);
+		s.adh_ip, s.adh_port, s.fallback_dns, s.fallback_dns6,
+		s.dot853, s.adh_mac, s.upstream_mode, s.isp_list4, s.isp_list6);
 }

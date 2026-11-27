@@ -41,7 +41,12 @@ case "$TMPBASE" in
 	*\\*|*:*) TMPBASE=/tmp ;;
 esac
 T="$TMPBASE/ds-g0.$$"
-trap 'rm -rf "$T"' 0 2 15
+# KEEP=1 时保留样本树，方便事后看门禁明细（调试用，CI 不要设）
+if [ "${KEEP:-0}" = 1 ]; then
+	trap 'echo "   （KEEP=1，样本树保留在 $T）"' 0
+else
+	trap 'rm -rf "$T"' 0 2 15
+fi
 mkdir -p "$T" || { echo "ERROR 建不了 $T"; exit 2; }
 
 [ -d "$PKG/luci-app-dns-switch" ] || { echo "ERROR 源码树不完整：$PKG"; exit 2; }
@@ -51,26 +56,48 @@ ok()  { NOK=$((NOK + 1));  printf '  PASS  自检 %s\n' "$*"; }
 bad() { NBAD=$((NBAD + 1)); printf '  FAIL  自检 %s\n' "$*"; }
 sk()  { NSKIP=$((NSKIP + 1)); printf '  SKIP  自检 %s\n' "$*"; }
 
-# ---- 造"好样本"：复制真实树，再补齐当前阶段还缺的部分 -------------------
+# ---- 造"好样本"：**自洽的合成树** -------------------------------------
+# 为什么不复制真实源码树：真实树每天都在变（P3 起每加一个模块都要登记清单）。
+# 一旦复制，"好样本"会跟着真实树一起变红/变绿，G0 就不再是门禁的自检，而是
+# 源码的自检——那两件事必须分开。这里造一棵最小、可控、恒定的树：
+#   sh.uc(L0) → config.uc(L1) → main.uc(L5 程序)，export 互相被真实消费（G4 绿）
+#   modules.txt 由目录推导（A1 绿），ACL 满覆盖（G6 绿），无 emoji（G5 绿）
 build_good() {   # $1=目标目录
 	d=$1
-	mkdir -p "$d/luci-app-dns-switch" "$d/test"
-	cp -r "$PKG/luci-app-dns-switch/." "$d/luci-app-dns-switch/" 2>/dev/null
-	[ -d "$PKG/test/unit" ] && cp -r "$PKG/test/unit" "$d/test/unit" 2>/dev/null
-	[ -f "$PKG/test/modules.txt" ] && cp "$PKG/test/modules.txt" "$d/test/modules.txt"
 	S="$d/luci-app-dns-switch"
-	# ① shim 换成桩：真实 shim 现在 1985 行（v1.0.1），在 G2 里本来就是红的，
-	#    那是真实状态不是缺陷；样本树要全绿才能当"好样本"。
-	{
-		echo '#!/bin/sh'
-		echo '# G0 样本桩：只为让 G2 行长门禁有绿样本'
-		echo 'case "$1" in'
-		echo '  rescue) exit 0 ;;'
-		echo 'esac'
-		echo 'exec ucode /usr/libexec/dns-switch/main.uc "$@"'
-	} > "$S/root/usr/bin/dns-switch"
-	# ② ACL 补 ubus 段（10 个方法全覆盖，read/write 按 SPEC §4.1 权限分组）
-	mkdir -p "$S/root/usr/share/rpcd/acl.d"
+	MOD="$S/root/usr/libexec/dns-switch"
+	mkdir -p "$MOD" "$d/test" "$S/root/usr/share/rpcd/ucode" \
+		"$S/root/usr/share/rpcd/acl.d" "$S/root/usr/bin" \
+		"$S/htdocs/luci-static/resources/view"
+
+	cat > "$MOD/sh.uc" <<'XSH'
+'use strict';
+export function run(cmd) { return cmd; }
+XSH
+	cat > "$MOD/config.uc" <<'XCFG'
+'use strict';
+import { run } from './sh.uc';
+export function load() { return run('cfg'); }
+XCFG
+	cat > "$MOD/main.uc" <<'XMAIN'
+'use strict';
+import { load } from './config.uc';
+function main(argv) { return load() == 'cfg' ? 0 : 1; }
+exit(main(ARGV));
+XMAIN
+	printf "'use strict';\nreturn { status: {} };\n" \
+		> "$S/root/usr/share/rpcd/ucode/dns-switch"
+	printf '#!/bin/sh\n# G0 样本桩\nexit 0\n' > "$S/root/usr/bin/dns-switch"
+	printf '// ui stub\n' > "$S/htdocs/luci-static/resources/view/g0_probe.js"
+
+	# 清单由目录推导：样本永远自洽（真实清单的登记责任不在自检里）
+	ls "$MOD"/*.uc 2>/dev/null | sed 's#.*/##' | grep -vx 'main.uc' | sort > "$d/test/modules.txt"
+	# 层图：与上面的 import 一一对应（config→sh），无环
+	cat > "$d/test/layers.txt" <<'LAY'
+sh.uc L0 fs
+config.uc L1 sh
+LAY
+
 	cat > "$S/root/usr/share/rpcd/acl.d/luci-app-dns-switch.json" <<'ACL'
 {
 	"luci-app-dns-switch": {
@@ -80,12 +107,6 @@ build_good() {   # $1=目标目录
 	}
 }
 ACL
-	# ③ 程序式文件（B 段的绿样本；真实仓库 P5 才有）
-	mkdir -p "$S/root/usr/share/rpcd/ucode"
-	printf "'use strict';\nfunction main(argv) { return 0; }\nexit(main(ARGV));\n" \
-		> "$S/root/usr/libexec/dns-switch/main.uc"
-	printf "'use strict';\nreturn { status: {} };\n" \
-		> "$S/root/usr/share/rpcd/ucode/dns-switch"
 }
 
 # 跑一次门禁，结果进 $1，返回 FAIL 数（解析结论行）
@@ -109,7 +130,7 @@ if [ "$nf" = 0 ]; then
 	ok "好样本：6 条门禁全过（无 FAIL）"
 else
 	bad "好样本反而红了（$nf 处）—— 门禁有误报，先修误报再谈抓缺陷"
-	grep '^FAIL' "$T/good.log" | sed 's/^/        /'
+	grep -A4 '^FAIL' "$T/good.log" | sed 's/^/        /' | head -20
 fi
 
 # ---- 坏样本：每条门禁注入一个缺陷，必须只有它那一条变红 ----
@@ -134,22 +155,32 @@ A=luci-app-dns-switch/root/usr/share/rpcd/acl.d/luci-app-dns-switch.json
 
 inject_g1_syntax() { printf '\nexport const broken_probe = ;\n' >> "$M/sh.uc"; }
 inject_g1_list()   { printf 'ghost_module.uc\n' >> test/modules.txt; }
+# 真实世界最常发生的一种：加了模块忘了登记（state.uc 就这么漏过一次）
+inject_g1_unreg()  { printf "'use strict';\nexport function newthing() { return 1; }\n" > "$M/zz_new.uc"; }
 inject_g1_prog()   { printf '\nfunction broken( {\n' >> "$M/main.uc"; }
 inject_g2_lines()  { i=0; while [ $i -lt 320 ]; do echo "// padding"; i=$((i + 1)); done >> "$M/lock.uc"; }
 inject_g3_layer()  { printf "\nimport { on } from './switch.uc';\n" >> "$M/config.uc"; }
+# 环：让 sh 反过来 import config，并在 layers.txt 里声明这条边
+inject_g3_cycle()  { printf "\nimport { load } from './config.uc';\n" >> "$M/sh.uc"
+                     sed -i 's/^sh.uc L0 fs$/sh.uc L0 fs,config/' test/layers.txt; }
+# 清单缺行：删掉 config 的层号声明
+inject_g3_missing(){ sed -i '/^config.uc /d' test/layers.txt; }
 inject_g4_orphan() { printf '\nexport function orphan_probe_fn() { return 1; }\n' >> "$M/lock.uc"; }
 inject_g5_emoji()  { printf '\n// \360\237\216\211\n' >> luci-app-dns-switch/htdocs/luci-static/resources/view/g0_probe.js; }
 inject_g6_acl()    { sed 's/"version"//; s/, *]/]/' "$A" > "$A.tmp" && mv "$A.tmp" "$A"; }
 
 if [ "$HAS_UC" = 1 ]; then
 	inject "模块语法错(export const x = ;)" "1/6" inject_g1_syntax
-	inject "清单漏登记(ghost_module.uc)"    "1/6" inject_g1_list
+	inject "清单多一行(ghost_module.uc)"     "1/6" inject_g1_list
+	inject "目录多模块未登记(zz_new.uc)"      "1/6" inject_g1_unreg
 	inject "程序式文件语法错(main.uc)"       "1/6" inject_g1_prog
 else
 	sk "G1 三项（本机无 ucode；清单一致性其实不需要 ucode，CI/设备上会全跑）"
 fi
 inject "文件 320 行(超 300)"        "2/6" inject_g2_lines
-inject "L1 import L4(向上依赖)"      "3/6" inject_g3_layer
+inject "import 了未声明的依赖(switch)"  "3/6" inject_g3_layer
+inject "依赖成环(sh ⇄ config)"          "3/6" inject_g3_cycle
+inject "layers.txt 缺 config 那行"      "3/6" inject_g3_missing
 inject "孤儿 export(无人引用)"        "4/6" inject_g4_orphan
 inject "前端 js 含 🎉"               "5/6" inject_g5_emoji
 inject "ACL 缺 version"              "6/6" inject_g6_acl

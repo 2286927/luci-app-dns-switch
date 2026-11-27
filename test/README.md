@@ -40,7 +40,11 @@ v1.1 把 1,985 行 shell 重写成 ucode，**第一风险不是功能少，而�
 | `golden/nft-block-nomac.nft` | fixture：`dot853=block`，无 MAC | 同上 |
 | `golden/nft-block-mac.nft` | fixture：`dot853=block`，MAC=`aa:bb:cc:dd:ee:ff` | 同上 |
 | `nft_golden.sh` | G1 门禁本体：生成 → 比较 → 报差异 → 给退出码 | QA |
-| `static_gates.sh` | SPEC §8.6 六条静态门禁（语法/行长/分层/孤儿/emoji/ACL），见 §8 | QA |
+| `static_gates.sh` | SPEC §8.6：G0 元检查 + 六条静态门禁，见 §8 | QA |
+| `selfcheck.sh` | G0 的实现：每条门禁 1 好 1 坏样本（自洽合成树，不依赖真实源码树） | QA |
+| `modules.txt` | 模块清单（一行一个文件名，禁止注释/空行/CRLF）。新模块不登记 → G1-A1 红 | 模块作者 |
+| `layers.txt` | 层图数据：`模块 L<层> dep1,dep2`。G3 用它做方向与环检测（白名单已作废） | 后端建、QA 用 |
+| `known-large.txt` | 豁免表：`相对路径 <截止阶段>`，最多 2 条，随 `$PHASE` 自动失效 | QA |
 | `unit/run_all.sh` | 单测统一 runner：逐套件 rc + 断言数对账 + 隔离模式，见 §9 | QA |
 | `unit/*_test.uc` | 四个 L0/L1 模块单测（151 断言） | 后端写、QA 复核 |
 
@@ -204,150 +208,233 @@ B 和 C 是成对的：**只测"能红"会写出永远红的脚本，只测"能�
 
 ---
 
-## 8. 静态门禁 `static_gates.sh`（SPEC §8.6 六条）
+## 8. 静态门禁 `static_gates.sh`（SPEC §8.6：G0 元检查 + 六条）
 
 ```sh
-sh test/static_gates.sh            # 日常：FAIL 才算问题，SKIP/WARN 只提示
-sh test/static_gates.sh --strict   # 发版前：SKIP 也算失败
+sh test/static_gates.sh              # 日常：FAIL 才算问题，SKIP/WARN 只提示
+sh test/static_gates.sh --strict     # 发版前：SKIP 也算失败
+sh test/static_gates.sh --no-g0      # 跳过 G0（自检脚本内部用）
+sh test/static_gates.sh --src DIR    # 检查另一棵源码树（自检脚本内部用）
 ```
 
 | # | 门禁 | 判据 |
 |---|---|---|
-| 1 | 模块语法 | 每个 `.uc` 能被 `ucode -e "import * as m from '<绝对路径>'"` 加载（**不是 `ucode -c`**，见下） |
-| 2 | 单文件 ≤300 行 | 计入 `.uc` + rpcd 对象 + sh 入口（I5 说的是「单文件」） |
-| 3 | 分层不越界 | `./x.uc` 的层号必须小于当前文件层号；L5 入口不受限；同层命中白名单打 WARN |
-| 4 | 无孤儿能力缝 | `export` 无人引用 → FAIL；只有测试引用 → WARN |
-| 5 | 无 emoji | 前端（`htdocs/`）命中 → FAIL；非前端 → WARN（I1 保护，见下） |
+| **G0** | **元检查** | 调 `test/selfcheck.sh`：每条门禁 1 个好样本 + 1 个坏样本，好样本不红、坏样本必红 |
+| 1 | 模块语法 | A1 清单一致性（`test/modules.txt` ↔ 实盘 `*.uc`）+ A2 `ucode -cmodule` 逐模块编译 + B `ucode -c` 编译程序式文件 |
+| 2 | 单文件 ≤300 行 | `.uc` + rpcd 对象 + sh 入口（I5 说的是「单文件」） |
+| 3 | 分层不越界 | `./x.uc` 的层号必须小于当前层；L5 入口不受限；SPEC 已声明的同层单向依赖打 WARN |
+| 4 | 无孤儿能力缝 | 生产代码无人引用 → FAIL；只有测试引用 → WARN |
+| 5 | 无 emoji | 前端（`htdocs/`）命中 → FAIL；非前端 → WARN（I1 保护，见 8.3） |
 | 6 | ACL 覆盖 | SPEC §4.1 的 10 个方法必须都在 ACL 的 `read`/`write` 的 ubus 列表里，且不得多出 |
 
-### 8.1 为什么门禁 1 不能用 `ucode -c`
+### 8.1 门禁 1 为什么是三段，而且判据换过两次
 
-`ucode -c` 把文件当**程序**编译，遇到 `export` 直接 255：
-
-```
-$ ucode -c -o /dev/null root/usr/libexec/dns-switch/sh.uc
-Syntax error: Exports may only appear at top level of a module
-```
-
-`ucode -h` 里没有任何模块开关，13 个模块全是 `export` 写法 → 这条门禁从第一天就 100% 红。
-改成 `import` 判据后是**编译 + 链接**，比原来更严（解析不到的依赖也一起抓）。
-负向对照已验：破坏语法 → 255 `Unable to compile module`；import 不存在的文件 → 255
-`Unable to resolve path for module`。
-
-### 8.2 门禁 5 踩过的坑：**空转的绿色比红色危险**
-
-第一版用 `od -A n -v -t u1` 取字节流。在 r68s 上实测 `od: not found`（busybox 没编这个 applet），
-管道输出为空 → awk 扫到 0 个字节 → 门禁打印"没有 emoji"并 **PASS**。
-注入 emoji 也照样 PASS —— 门禁自己变成了假绿灯。
-
-修法两层：
-1. 取字节流改用 `hexdump -v -e '1/1 "%u\n"'`，没有 `hexdump` 才退回 `od`；
-2. **加扫描器自检**：每次运行先扫一个自己造的 `U+1F525`，扫不出来直接 FAIL
-   （"扫描器自检失败…不许当作通过"）。两个工具都没有也 FAIL。
-
-反向证明过：把假 `hexdump`（只 `exit 0`）塞进 PATH → 门禁 rc=1 且打印自检失败，
-而不是悄悄放行。
-
-### 8.3 emoji 为什么分前端/非前端两档
-
-团队 P0 管的是「emoji 当**功能图标**」。当前 9 处命中全在 v1.0.1 的 CLI 里：
-`✓`/`✗` 是 stdout 的终端状态符号，`⚠` 在源码注释里。而 stdout 受不变量 I1
-（与 v1.0.1 **逐字节一致**）保护——删掉它们会直接破坏 C2/C6 兼容项。
-所以：前端命中判 P0 失败，非前端命中一律 WARN 并把命中点全列出来，由人裁决。
-**不是放过，是不许静默。**
-
-### 8.4 当前结论（2026-11-24，r68s）
-
-```
-PASS 1/6 模块语法      4 个模块 import 成功
-FAIL 2/6 单文件 ≤300    root/usr/bin/dns-switch 1985 行  ← v1.0.1 shim 还没重写
-PASS 3/6 分层不越界 + WARN 1（log→sh 同层，SPEC §3.2 已声明）
-PASS 4/6 无孤儿 + WARN 8（8 个 export 只有测试引用：消费者模块 P3 才写）
-PASS 5/6 无 emoji + WARN 9（非前端符号，I1 保护）
-FAIL 6/6 ACL 覆盖      ACL 还没有 ubus 段，10 个方法都没覆盖
-== 3 PASS / 2 FAIL / 3 WARN / 1 SKIP ==
-```
-
-两条 FAIL 都是**真实状态**，不是误报：
-
-- **2/6**：`root/usr/bin/dns-switch` 还是 v1.0.1 的 1985 行。SPEC §2.1 要求它瘦到 ≈130 行
-  （只留 rescue + exec）。在 shim 重写之前这条会一直红——这是事实，不要 `|| true`。
-- **6/6**：ACL 现在只有 v1.0.1 的 `uci`/`file` 权限。P4 加 rpcd 对象时必须补 `ubus` 段。
-
-**§3.1 与 §3.2 有互相矛盾之处**（层次图画 `status ──► bundle`，§3.2 表格写 `bundle` 依赖 `status`）。
-门禁暂时把两个方向都放进白名单并打 WARN，等架构师统一；统一后白名单要收敛成一条。
-
-### 8.5 静态门禁的负向对照（证明它会红）
-
-在 r68s 上注入验证，逐条：
-
-| 注入 | 期望 | 实测 |
+| 写法 | 结论 | 依据 |
 |---|---|---|
-| `nft.uc` 里 `import './switch.uc'`（L2→L4） | 分层 FAIL | ✅ 命中 `L2 → L4 违规` |
-| `import '../foo.uc'` | 非 `./` 相对 import FAIL | ✅ 命中 |
-| 加 `export function never_used_by_anyone()` | 孤儿 FAIL | ✅ 命中 |
-| 破坏 `sh.uc` 语法 | 门禁 1 FAIL | ✅ 命中（真 ucode 才验得出） |
-| 前端 js 加 emoji | 门禁 5 FAIL | ✅ 命中 |
-| 非前端加 `✓` | 只 WARN，前端不红 | ✅ WARN=1 / 前端 FAIL=0 |
-| 假 `hexdump`（`exit 0`） | 扫描器自检 FAIL | ✅ rc=1 |
-| ACL 补齐 10 方法 | 门禁 6 PASS | ✅ 命中全覆盖 |
-| ACL 删 `version` | 报缺 1 | ✅ 命中 |
-| ACL 加 `bogus_method` | 报多 1 | ✅ 命中 |
-| 全部还原 | 与基线一致 | ✅ 相等；`/tmp/static_gates.*` 残留 0 |
+| `ucode -c` | ❌ 对含 `export` 的模块必 255 | `Exports may only appear at top level of a module` |
+| `ucode -e "import …"` | ❌ 能绿能红，但**会执行模块顶层代码** | 现在顶层是纯定义所以无害；P5 起任何顶层 IO 都会让"静态门禁"把程序跑一遍 |
+| `ucode -cmodule` | ✅ 只编译，且**连带解析 import** | 把 `'./sh.uc'` 改成 `'./no_such.uc'` → 255 `Unable to resolve path for module` |
 
----
+`-cmodule` 的**标志必须紧贴** `-c`：写成 `-c module` 会把 `module` 当文件名（`Failed to open "module"`）。
+`-o /dev/null` 不能省：否则在 CWD 生成 `uc.out`，CI 从仓库根跑会把它写进源码树。
 
-## 9. 单测 runner `unit/run_all.sh`
+**四行形态矩阵**（实测，含我补的一行）：
+
+| 文件形态 | `-cmodule` | `-c` |
+|---|---|---|
+| ① 有 export、无顶层 return（模块） | 0 | 255 |
+| ② 无 export、无顶层 return（`main.uc`） | **0（天然假绿）** | 0 |
+| ②' 同 ② 但**带 import** | 0 | **0**（2026-11-24 我补测；真实 `main.uc` 一定会 import，这条决定 B 段能不能覆盖它） |
+| ③ 无 export、有顶层 return（rpcd 对象） | 255 | 0 |
+| ④ 有 export + 仅函数内 return | 0 | 255 |
+
+第 ② 行是 A1 存在的原因：`main.uc` 走 `-cmodule` 也是 0，**它没有自然红灯**，只能靠清单钉死。
+
+### 8.2 `test/modules.txt` 的契约
+
+纯文件名、一行一个，**禁止注释行 / 空行 / CRLF**。A1 用 `cmp` 比，多一行只报
+`cmp: EOF on …`，看着像文件被截断 → 所以脚本对格式单独判一条，并在失败提示里直接写明
+"新模块忘了登记？"。
+
+未登记 → 红，多登记 → 红，目录里多出未登记文件 → 红。三面都堵住。
+
+### 8.3 门禁 5：**空转的绿色比红色危险**
+
+第一版用 `od -A n -v -t u1` 取字节流。r68s 上 `od: not found`（busybox 没编这个 applet），
+而且**命令不存在时退出码是 0**，`2>/dev/null` 一吞 → awk 收到 0 字节 → 判 PASS。
+注入 emoji 也照样 PASS。改了两层：
+
+1. 取字节流改用 `hexdump -v -e '1/1 "%u\n"'`，没有 `hexdump` 才退回 `od`；
+2. **扫描器自检**：每次先扫一个自造的 `U+1F525`，扫不出来直接 FAIL。两个工具都没有也 FAIL。
+
+反向证明：塞一个只 `exit 0` 的假 `hexdump` 进 PATH → 门禁 rc=1 并报自检失败。
+
+emoji 分两档的原因：9 处命中全在 v1.0.1 的 CLI 里（`✓`/`✗` 在 stdout、`⚠` 在注释），
+而 stdout 受不变量 I1（与 v1.0.1 逐字节一致）保护。团队 P0 管的是「emoji 当**功能图标**」，
+不是「终端里的状态符号」。所以前端命中判 P0，非前端一律 WARN 并全列出来——**不是放过，是不许静默**。
+
+### 8.4 分层：白名单已作废，改成 `layers.txt` + 环检测
+
+早期实现是"同层依赖逐个特批白名单"。架构师否掉了（U16）：**容忍久了没人记得为什么容忍**——
+`log → sh` 就是这样被"转正"的。现在只有数据 + 一条判据：
+
+```
+test/layers.txt
+  config.uc L1 uci,log,state     ← 模块 层号 依赖(逗号分隔；fs/uci 这类外部依赖不参与层图)
+  lock.uc   L0 fs,fsutil
+  log.uc    L0 sh
+  sh.uc     L0 fs
+  fsutil.uc L0 fs
+  state.uc  L1 uci,log
+```
+
+| 检查 | 判据 |
+|---|---|
+| 覆盖性 | `layers.txt` 的模块集合 == 实盘 `*.uc`（排除 `main.uc`），两边差一个即红 |
+| 跨层 | 只允许 `目标层 < 源层` |
+| 同层 | 允许单向；**全图做环检测**，有环即红并打印环路径 |
+| 一致性 | 源码里每个 `import` 都必须在 `layers.txt` 声明；声明了但没 import → WARN（过期声明） |
+
+环检测是 awk 的 DFS（三色标记），实测输出：
+
+```
+✗ 依赖成环：log → sh → log
+  同层允许单向，但不许绕回来。环上任意一条边都得断。
+FAIL  [3/6 分层不越界] 1 处分层/依赖问题
+```
+
+**为什么不能把"声明了但没 import"直接判红**：它不是错，是**信号**——当前就抓到一处：
+`layers.txt` 声明 `config → log`，但 `config.uc` 只 import `state`（log 的依赖已挪进 `state`）。
+要么表过期、要么代码退化，得人看一眼。判成 WARN 就是为了让它可见而不误杀。
+
+### 8.5 豁免机制 `known-large.txt`（fail-closed）
+
+```
+root/usr/bin/dns-switch P4                                  ← v1.0.1 shim，P4 要缩到 ≈130 行
+root/usr/share/rpcd/acl.d/luci-app-dns-switch.json P4        ← ACL 还没 ubus 段，P4 补
+```
+
+| 规则 | 行为 |
+|---|---|
+| `$PHASE` 未设 | **不豁免，照旧红**（fail-closed：CI 配错时要全部报错，不能变成全部豁免） |
+| `$PHASE` 早于截止阶段 | SKIP，**独立计数**，汇总打 `G2: 6 ok / 1 SKIP` |
+| `--strict` | SKIP 转 FAIL |
+| 条目上限 | 2 条，第 3 条即红（防豁免表变垃圾桶） |
+| 到期 | 到截止阶段即红，不给续期 |
+| 实现方式 | 只从文件读，**禁止 `case … continue` 硬编码跳过** |
+
+### 8.6 负向对照（G0 自动跑的就是这张表）
+
+`sh test/selfcheck.sh` 在**自洽的合成树**上跑（不复制真实源码树——真实树每天在变，
+复制会让 G0 跟着一起红绿，那就不是门禁自检而是源码自检了）。合成树：
+`sh.uc(L0) → config.uc(L1) → main.uc(L5)`，export 互相被真实消费。
+
+```
+== G0 元检查：每条门禁 1 好样本 + 1 坏样本 ==
+  PASS  自检 好样本：6 条门禁全过（无 FAIL）
+  PASS  自检 坏样本 模块语法错(export const x = ;) → 门禁 1/6 报红
+  PASS  自检 坏样本 清单多一行(ghost_module.uc)     → 门禁 1/6 报红
+  PASS  自检 坏样本 目录多模块未登记(zz_new.uc)      → 门禁 1/6 报红
+  PASS  自检 坏样本 程序式文件语法错(main.uc)        → 门禁 1/6 报红
+  PASS  自检 坏样本 文件 320 行(超 300)             → 门禁 2/6 报红
+  PASS  自检 坏样本 import 了未声明的依赖(switch)     → 门禁 3/6 报红
+  PASS  自检 坏样本 依赖成环(sh ⇄ config)            → 门禁 3/6 报红
+  PASS  自检 坏样本 layers.txt 缺 config 那行         → 门禁 3/6 报红
+  PASS  自检 坏样本 孤儿 export(无人引用)             → 门禁 4/6 报红
+  PASS  自检 坏样本 前端 js 含 🎉                    → 门禁 5/6 报红
+  PASS  自检 坏样本 ACL 缺 version                   → 门禁 6/6 报红
+== G0 结论：PASS（12 条自检成对通过）==
+```
+
+「好样本必须不红」是**必须的**：只测坏样本会写出"任何输入都 FAIL"的门禁，看起来严格，
+实际和第 3 条一样是废的（最后一定被 `|| true` 掉）。
+`KEEP=1 sh test/selfcheck.sh` 可保留样本树查明细。
+
+### 8.7 当前结论（2026-11-24，r68s，`PHASE=P3`）
+
+```
+PASS  [G0 元检查]     12 条成对自检通过
+PASS  [1/6 模块语法]  清单一致 + 6 个模块 -cmodule 通过（state.uc 已登记）
+PASS  [2/6 ≤300 行]   6 ok / 1 SKIP（root/usr/bin/dns-switch 1985 行，豁免到 P4）
+PASS  [3/6 分层]      5 条依赖边无环、方向合法 + WARN 1（config→log 声明了但没 import）
+PASS  [4/6 无孤儿]    + WARN（仅测试引用的 export，消费者模块 P3 才写）
+PASS  [5/6 无 emoji]  + WARN 9（非前端符号，I1 保护）
+SKIP  [6/6 ACL 覆盖]  豁免到 P4（PHASE=P3）
+== 结论：5 PASS / 0 FAIL / 4 WARN / 1 SKIP ==
+```
+
+**不设 `PHASE` 时 G2/G6 会红——这是有意的**，验 fail-closed 就用这个姿势：
+`sh test/static_gates.sh` 不给 `PHASE` 必须红，给了 `PHASE=P3` 才 SKIP，加 `--strict` 再红。
+
+## 9. 汇总器 `unit/run_all.sh`
 
 ```sh
-sh test/unit/run_all.sh              # 逐套件跑，看 rc + 断言数
-sh test/unit/run_all.sh --verbose    # 附每个套件的完整输出
-sh test/unit/run_all.sh --isolated   # 每个套件前清空 /tmp/ds-v11（CI 用这个）
+sh test/unit/run_all.sh               # 7 个组件：5 个单测 + G1 nft + 静态门禁
+sh test/unit/run_all.sh --isolated    # 单测每套件前清空 /tmp/ds-v11（CI 用）
+sh test/unit/run_all.sh --selftest    # 只验汇总器自己会不会假绿
+sh test/unit/run_all.sh --verbose     # 附每个组件输出
 ```
 
-它比"逐个跑一遍看 rc"多查四件事，因为 **rc=0 本身什么都不证明**：
+### 9.1 判据：必须有结束标记，不是"没看到 FAIL 就算过"
 
-| 检查 | 抓什么 |
+组件被 kill / 超时 / 提前 exit 时不会有正常输出。若判据写成"PASS 数 ≥ N"或"没有 FAIL 就过"，
+就会报成通过。所以每个组件**必须出现自己的结束标记**，没标记直接判失败，不管它输出了多少 PASS：
+
+| 组件 | 结束标记 |
 |---|---|
-| 末行约定 `xxx_test: N passed, M failed` | 有人改了输出格式、或提前 return |
-| 自报数 vs 实际 `^PASS`/`^FAIL` 行数 | 少打印几行却声称 100% 通过 |
-| 断言数不许为 0 | 空测试 + rc=0（最典型的假绿） |
-| `eq()`/`ok()` 调用点 vs 实际执行数 | 条件分支里被静默跳过的断言 → WARN |
+| 单测套件 | 末非空行 `^<name>_test: N passed, M failed$` |
+| `nft_golden.sh` | 含 `^== 结论：` |
+| `static_gates.sh` | 含 `^== 结论：` |
 
-### 9.1 `--isolated` 是被真事逼出来的
+外加四道对账（针对单测）：自报数 vs 实际 `^PASS`/`^FAIL` 行数、断言数不许为 0、
+`eq()/ok()` 调用点 vs 实际执行数（不一致打 WARN）、组件文件必须存在。
 
-第一版按字母序跑（config → lock → log → sh），在 r68s 全新镜像上
-**`config_test` 直接 FAIL，rc=254**：
+### 9.2 汇总器自检：4 个假套件
 
-```
-FAIL  config_test    rc=254
-      got =false   want=true        ← load() ok
-      got ='E_UCI_COMMIT'  want='OK'
-```
-
-根因：`config_test` 用 `fs.mkdir(BASE)` 建 `/tmp/ds-v11/ut-cfg`，而 **`fs.mkdir` 不建父目录**，
-干净机器上 `/tmp/ds-v11` 根本不存在 → 写配置失败 → E_UCI_COMMIT；之后收尾里
-`fs.rmdir` 又对不存在的路径抛错 → rc 变 254。
-
-更值得记的是它**为什么一直没被发现**：按 `sh→lock→log→config` 的顺序跑时，
-`lock_test` 先用 `mkdir_p()` 把 `/tmp/ds-v11` 建了出来，`config_test` 白捡一个父目录，
-看起来全绿。**这是套件间的隐式顺序依赖**，只有把每个套件单独丢进空 `/tmp` 才会露出来。
-
-已修（`config_test.uc`）：补 `mkdir_p()`、收尾改用 `rm_if_exists()` 并加三条"确实删干净"的断言。
-`--isolated` 就是把这个场景固化下来，CI 必须用它。
-
-诚实记录：这一轮之前我报过「干净起点已验证通过」，那次是在 `sh→lock→log→config` 顺序下跑的，
-**证据不足，结论不成立**。是 runner 换了执行顺序才把它暴露出来的。
-
-### 9.2 现状（r68s，2026-11-24）
+`--selftest` 造 4 个假套件喂给汇总器，必须只放过第一个：
 
 ```
-PASS  config_test     55 断言  rc=0
-PASS  lock_test       37 断言  rc=0
+PASS  good_test        3 断言  rc=0
+FAIL  killed_test    缺结束标记（被 SIGKILL）
+FAIL  silent_test    缺结束标记（一行输出都没有、rc=0）
+FAIL  zero_test      0 断言（空测试不许算通过）
+== 汇总器自检：PASS（4/4 判断正确，整体 rc=1）==
+```
+
+「静默 exit 0」是最危险的一种：没有任何输出 ≠ 一切正常。这条和 `od` 缺失、`grep -P` rc=2
+是同一类病，本轮一共踩了三次。
+
+### 9.3 `--isolated` 是被真事逼出来的
+
+按字母序跑（config → fsutil → lock → log → sh）时，`config_test` 在全新 `/tmp` 上直接 FAIL
+（rc=254，`load() ok=false E_UCI_COMMIT`）：它用 `fs.mkdir` 建 `/tmp/ds-v11/ut-cfg`，
+而 `fs.mkdir` **不建父目录**，干净机器上父目录不存在。
+
+它一直绿的原因：按 `sh→lock→log→config` 顺序跑时，`lock_test` 先用 `mkdir_p()` 把
+`/tmp/ds-v11` 建了出来 → `config_test` 白捡一个父目录。**套件间的隐式顺序依赖**，
+让"全绿"变成执行顺序的副产品。已修（补 `mkdir_p` + 收尾断言），并由 `--isolated` 固化成门禁。
+
+### 9.4 现状（r68s，2026-11-24，两轮连跑）
+
+```
+PASS  config_test     68 断言  rc=0
+PASS  fsutil_test     26 断言  rc=0
+PASS  lock_test       57 断言  rc=0
 PASS  log_test        37 断言  rc=0
 PASS  sh_test         22 断言  rc=0
-== 合计：4 套件 / 151 断言 / 0 套件失败 ==
+PASS  nft_golden     rc=0   （结论 SKIP：nft.uc 未落地）
+PASS  static_gates   rc=0   （PHASE=P3：G2 6ok/1SKIP、G6 SKIP）
+== 合计：7 组件 / 210 单测断言 / 0 失败 ==
+== 结论：PASS（所有组件都有结束标记、rc=0、自报数与实际一致）==
 ```
 
-三种模式都验过：默认（干净起点）、连跑两轮（幂等）、`--isolated`（每套件独占空 `/tmp`）。
+两轮 `cmp` **逐字节相同**（`ROUNDS_IDENTICAL=YES`），两轮 rc 都 0，`/tmp/ds-v11` 零残留。
 
+跑法上有一个前提要记住：**汇总器会把环境变量透传给静态门禁**，所以 CI 里这样跑：
+
+```sh
+PHASE=P3 sh test/unit/run_all.sh --isolated     # P3 阶段允许 known-large.txt 的豁免
+```
+
+不给 `PHASE` 时 G2（shim 1985 行）与 G6（ACL 无 ubus）会红——那是 fail-closed 生效，
+不是汇总器坏了。

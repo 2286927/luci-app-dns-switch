@@ -12,6 +12,7 @@
 // ============================================================
 
 import * as config from '../../luci-app-dns-switch/root/usr/libexec/dns-switch/config.uc';
+import * as state from '../../luci-app-dns-switch/root/usr/libexec/dns-switch/state.uc';
 
 let fs = require('fs');
 
@@ -82,10 +83,11 @@ function rm_if_exists(path) {
 rm_if_exists(BASE);
 mkdir_p(BASE);
 
-// ---- 0. 没 load() 就 commit()：不许静默成功 ----
-let r = config.commit();
-eq("未 load 就 commit() → ok=false", r.ok, false);
-eq("未 load 就 commit() → E_INTERNAL", r.code, "E_INTERNAL");
+// ---- 0. 没 open/load 就 commit：不许静默成功 ----
+// 写路径在 state（config 不提供别名），所以这里直接打 state.commit()。
+let r = state.commit();
+eq("未 load 就 commit → ok=false", r.ok, false);
+eq("未 load 就 commit → E_INTERNAL", r.code, "E_INTERNAL");
 eq("未 load 时 sig() 为空串", config.sig(), "");
 
 // ---- 1. 配置文件不存在 → 按 v1.0.1 ensure_config 建出来 ----
@@ -101,17 +103,17 @@ ok("建出来的文件含 config status 'status'", match(text, /config status 's
 ok("建出来的文件含 option isp_list4", match(text, /option isp_list4 '202\.103\.224\.68 202\.103\.225\.68'/) != null);
 
 // ---- 2. §3.4 缺省值在 load() 里已 resolve ----
-eq("mode 默认 off", c.mode, "off");
-eq("adh_ip 默认 172.16.1.2", c.adh_ip, "172.16.1.2");
-eq("adh_port 保持 uci 的字符串", c.adh_port, "3030");
-eq("adh_port 类型是 string", type(c.adh_port), "string");
-eq("fallback_dns 默认 172.16.5.5", c.fallback_dns, "172.16.5.5");
-eq("fallback_dns6 默认空", c.fallback_dns6, "");
-eq("adh_mac 默认空", c.adh_mac, "");
-eq("dot853 默认 allow", c.dot853, "allow");
-eq("upstream_mode 默认 auto", c.upstream_mode, "auto");
-eq("probe_domain 默认 www.baidu.com", c.probe_domain, "www.baidu.com");
-eq("isp_list 遗留字段默认空", c.isp_list, "");
+eq("mode 默认 off", c.settings.mode, "off");
+eq("adh_ip 默认 172.16.1.2", c.settings.adh_ip, "172.16.1.2");
+eq("adh_port 保持 uci 的字符串", c.settings.adh_port, "3030");
+eq("adh_port 类型是 string", type(c.settings.adh_port), "string");
+eq("fallback_dns 默认 172.16.5.5", c.settings.fallback_dns, "172.16.5.5");
+eq("fallback_dns6 默认空", c.settings.fallback_dns6, "");
+eq("adh_mac 默认空", c.settings.adh_mac, "");
+eq("dot853 默认 allow", c.settings.dot853, "allow");
+eq("upstream_mode 默认 auto", c.settings.upstream_mode, "auto");
+eq("probe_domain 默认 www.baidu.com", c.settings.probe_domain, "www.baidu.com");
+eq("isp_list 遗留字段默认空", c.settings.isp_list, "");
 
 // ---- 3. opt() ----
 eq("opt(mode) 取到已 resolve 值", config.opt('mode', 'X'), "off");
@@ -131,10 +133,10 @@ eq("status.error 缺省为空串不是 null", type(c.status.error), "string");
 eq("status.applied_sig 缺省为空串", c.status.applied_sig, "");
 
 // ---- 6. state_set + commit 生效 ----
-eq("state_set(effective,on) 返回 true", config.state_set('effective', 'on'), true);
-eq("同一值再写一次仍 true（不重复写 flash）", config.state_set('effective', 'on'), true);
-eq("state_set 数字按字符串写", config.state_set('last_change', 1763952000), true);
-r = config.commit();
+eq("state_set(effective,on) 返回 true", state.set_status('effective', 'on'), true);
+eq("同一值再写一次仍 true（不重复写 flash）", state.set_status('effective', 'on'), true);
+eq("state_set 数字按字符串写", state.set_status('last_change', 1763952000), true);
+r = state.commit();
 eq("commit() ok", r.ok, true);
 eq("commit() code=OK", r.code, "OK");
 
@@ -143,7 +145,7 @@ eq("重读后 effective=on", again.status.effective, "on");
 eq("重读后 last_change 是字符串", again.status.last_change, "1763952000");
 
 // 没有改动时 commit() 是空操作
-r = config.commit();
+r = state.commit();
 eq("无改动 commit() ok", r.ok, true);
 
 // ---- 7. 缺键 / 空值都 resolve 成默认（对应 shell 的 ${X:-default}）----
@@ -157,10 +159,10 @@ fs.writefile(CONF, join('\n', [
 	""
 ]));
 c = config.load({ confdir: BASE });
-eq("缺 adh_ip → 默认 172.16.1.2", c.adh_ip, "172.16.1.2");
-eq("adh_port 空值 → 默认 3030", c.adh_port, "3030");
-eq("mode 有值就用值（on）", c.mode, "on");
-eq("缺 dot853 → 默认 allow", c.dot853, "allow");
+eq("缺 adh_ip → 默认 172.16.1.2", c.settings.adh_ip, "172.16.1.2");
+eq("adh_port 空值 → 默认 3030", c.settings.adh_port, "3030");
+eq("mode 有值就用值（on）", c.settings.mode, "on");
+eq("缺 dot853 → 默认 allow", c.settings.dot853, "allow");
 eq("sig() 跟着变（adh_port 回到 3030）",
 	config.sig(), "172.16.1.2|3030|172.16.5.5||allow||auto||");
 
@@ -175,8 +177,8 @@ eq("缺 status 段时 load() 仍 ok", c.ok, true);
 text = fs.readfile(CONF);
 ok("status 段被补建", match(text, /config status 'status'/) != null);
 eq("补建后 status.effective 是空串", c.status.effective, "");
-eq("补建后能正常 state_set", config.state_set('probe', 'ok'), true);
-eq("补建后 commit ok", config.commit().ok, true);
+eq("补建后能正常 state_set", state.set_status('probe', 'ok'), true);
+eq("补建后 commit ok", state.commit().ok, true);
 eq("重读看到 probe=ok", config.load({ confdir: BASE }).status.probe, "ok");
 
 // ---- 9. 重复 load 不重复写、不再补建 ----
@@ -190,6 +192,38 @@ let bad = config.load({ confdir: '/tmp/ds-v11/ut-cfg-nodir/deeper' });
 eq("目录不存在时 load() ok=false", bad.ok, false);
 eq("目录不存在时 code=E_UCI_COMMIT", bad.code, "E_UCI_COMMIT");
 ok("失败时带人话 message", type(bad.message) == "string" && length(bad.message) > 0);
+
+// ---- 10b. 方案 B：失败也返回完整骨架（空哨兵，不用 null）----
+// 没有这一段，漏判 ok 的消费方会 `cfg.status.effective` 对 null 取字段 → rc=254 崩溃，
+// 而 254 不在 §4.2 的 0/1/2/3/4/75 里，脚本侧完全看不懂。
+ok("失败时 settings 仍然存在（方案 B 的核心）", bad.settings != null);
+ok("失败时 status 仍然存在", bad.status != null);
+eq("骨架 settings.mode 是空串", bad.settings.mode, "");
+eq("骨架 settings.adh_port 是空串", bad.settings.adh_port, "");
+eq("骨架 status.effective 是空串", bad.status.effective, "");
+eq("骨架空哨兵是 string 不是 null（N2：type(null) 判不出来）", type(bad.status.effective), "string");
+eq("骨架 status.last_change 是数值 0（唯一数值字段）", bad.status.last_change, 0);
+eq("骨架 status.error 是空串", bad.status.error, "");
+eq("失败时 sig() 返回空串（不拿骨架拼签名）", config.sig(), "");
+eq("失败时 opt() 拿到空哨兵空串（既不是 def 也不是 null）", config.opt("mode", "DEF"), "");
+
+// ---- 10c. 元测试：守方案 B 唯一的失守方式（错误变安静）----
+// 骨架让"漏判 ok"不再崩，代价是它会静默读到空值。所以同时钉住两件事：
+//   ① 漏判的消费方不崩，只拿到空哨兵；
+//   ② 查了 ok 的消费方能拿到可读错误码 —— 两者差别只在有没有查 ok。
+function consumer_forgets_ok(c) {
+	return "effective=" + c.status.effective + ";mode=" + c.settings.mode;
+}
+
+function consumer_checks_ok(c) {
+	if (c.ok != true) return "code=" + c.code;
+	return "effective=" + c.status.effective;
+}
+
+eq("漏判 ok 的消费方不崩，只读到空哨兵", consumer_forgets_ok(bad), "effective=;mode=");
+eq("查了 ok 的消费方拿到可读错误码", consumer_checks_ok(bad), "code=E_UCI_COMMIT");
+ok("同一个骨架、两个消费方结论不同 —— 差别只在有没有查 ok",
+	consumer_checks_ok(bad) != consumer_forgets_ok(bad));
 
 // ---- 11. 收尾：把自己的临时目录清干净，下一轮/CI 才是干净起点 ----
 eq("收尾：ut-cfg 已删除", rm_if_exists(BASE), true);
