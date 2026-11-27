@@ -81,7 +81,18 @@ if [ ! -f "$HERE/audit_exports.awk" ]; then
 	exit 2
 fi
 
-awk -f "$HERE/audit_exports.awk" "$SPEC" | sort -u > "$TMPD/spec.exports"
+awk -f "$HERE/audit_exports.awk" "$SPEC" > "$TMPD/spec.raw"
+# 解析器明确报出"这一行的模块名我不认识"，就不许继续——否则整行被静默跳过，
+# 表现为"代码有、契约无"，方向上骗人（switch-tier 那次就是这样）。
+unparsed=$(grep '^__UNPARSED__' "$TMPD/spec.raw" 2>/dev/null)
+if [ -n "$unparsed" ]; then
+	printf 'FAIL  [A4 导出列一致性] SPEC §3.2 有模块名不被解析器接受：\n'
+	printf '%s\n' "$unparsed" | sed 's/^__UNPARSED__ /        /'
+	printf '      先修解析器（test/audit_exports.awk 的模块名正则），不许当作通过。\n'
+	printf '\n== 结论：FAIL  0/1（SPEC 有行未被解析）==\n'
+	exit 1
+fi
+grep -v '^__UNPARSED__' "$TMPD/spec.raw" | sort -u > "$TMPD/spec.exports"
 awk '/^export (function|const|let) /{
 		n = $3; sub(/[(].*/, "", n); printf "%s %s\n", FILENAME, n
 	}' "$MODDIR"/*.uc 2>/dev/null \

@@ -77,29 +77,18 @@ eq("冷却期内即使失败 5 次 → wait",
 
 // ---- 4. tier_on：连续成功 / 链在不在决定 full vs reload ----
 let os1 = function (n, chain) { return { now: 1000, cool_at: 0, effective: 'failover', ok_streak: n, chain_exists: chain }; };
-eq("成功 1 次 → wait（阈值 2）", tier.tier_on(os1(1, 1), ON, null).action, "wait");
-eq("成功 2 次且链在 → reload", tier.tier_on(os1(2, 1), ON, null).action, "reload");
-eq("成功 2 次但链不在 → full", tier.tier_on(os1(2, 0), ON, null).action, "full");
+eq("成功 1 次 → wait（阈值 2）", tier.tier_on(os1(1, 1), ON).action, "wait");
+eq("成功 2 次且链在 → reload", tier.tier_on(os1(2, 1), ON).action, "reload");
+eq("成功 2 次但链不在 → full", tier.tier_on(os1(2, 0), ON).action, "full");
 eq("mode=off → skip", tier.tier_on(os1(9, 1), OFF, null).action, "skip");
-eq("已 on → skip", tier.tier_on({ now: 1000, effective: 'on', ok_streak: 9, chain_exists: 1 }, ON, null).action, "skip");
+eq("已 on → skip", tier.tier_on({ now: 1000, effective: 'on', ok_streak: 9, chain_exists: 1 }, ON).action, "skip");
 eq("冷却期内 → wait",
-	tier.tier_on({ now: 1050, cool_at: 1000, effective: 'failover', ok_streak: 9, chain_exists: 1 }, ON, null).action, "wait");
+	tier.tier_on({ now: 1050, cool_at: 1000, effective: 'failover', ok_streak: 9, chain_exists: 1 }, ON).action, "wait");
 
-// ---- 5. onFn 注入：只有 full 且传了 onFn 才真的执行 ----
-let called = 0;
-let opts = { onFn: function () { called++; } };
-let r1 = tier.tier_on(os1(2, 0), ON, opts);
-eq("full + 传 onFn → applied=true", r1.applied, true);
-eq("full + 传 onFn → onFn 被调 1 次", called, 1);
-
-let r2 = tier.tier_on(os1(2, 1), ON, opts);
-eq("reload 不调 onFn", r2.applied, false);
-eq("reload 后 onFn 仍只被调 1 次", called, 1);
-
-let r3 = tier.tier_on(os1(2, 0), ON, null);
-eq("没传 onFn → 只回决策，applied=false", r3.applied, false);
-eq("没传 onFn → 决策仍是 full", r3.action, "full");
-eq("没传 onFn 时不会被调用（called 不变）", called, 1);
+// ---- 5. 链在/不在决定 reload 还是 full（只回决策，不执行动作）----
+eq("链不在 → full", tier.tier_on(os1(2, 0), ON).action, "full");
+eq("链在 → reload", tier.tier_on(os1(2, 1), ON).action, "reload");
+eq("决策里没有 applied 字段（type(null) 返回 null，不能和字符串比）", tier.tier_on(os1(2, 0), ON).applied, null);
 
 // ---- 6. 纯函数自证：同样的入参两次结果一致，且不依赖全局 ----
 let a = tier.tier_failover(fs1(2), ON);

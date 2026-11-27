@@ -83,32 +83,26 @@ export function tier_failover(state, cfg) {
 }
 
 /**
- * 该不该回切。返回 { action:'full'|'reload'|'wait'|'skip', why, applied }。
+ * 该不该回切。返回 { action:'full'|'reload'|'wait'|'skip', why }。
  *   full  : 劫持链不在 → 必须走完整的 on（否则只有上游没有劫持）
  *   reload: 链在，只需重下发上游（<1s，比 on 便宜）
  *   wait  : 连续成功不够 / 冷却期内
- * 传了 opts.onFn 且 action=='full' 时才真的执行，`applied=true`。
- * **不传 onFn 就只回决策**——单测靠这个保持纯净。
+ * **只回决策、不执行**：回切后重下发走 dnsmasq/nft，不调 switch.on，
+ * 所以既不需要 onFn 也不需要 applied（U30：没人用的参数就是过度设计）。
  */
-export function tier_on(state, cfg, opts) {
+export function tier_on(state, cfg) {
 	let st = (state != null && type(state) == 'object') ? state : {};
 	let eff = opt_of(st, 'effective', '');
 	let streak = opt_of(st, 'ok_streak', 0);
 
-	if (setting(cfg, 'mode') != 'on') return { action: 'skip', why: 'mode 不是 on', applied: false };
-	if (eff == 'on') return { action: 'skip', why: '已经是 on', applied: false };
-	if (cooling(st, cfg)) return { action: 'wait', why: '冷却期内', applied: false };
+	if (setting(cfg, 'mode') != 'on') return { action: 'skip', why: 'mode 不是 on' };
+	if (eff == 'on') return { action: 'skip', why: '已经是 on' };
+	if (cooling(st, cfg)) return { action: 'wait', why: '冷却期内' };
 	if (streak < SUCC_N) {
-		return { action: 'wait', why: sprintf('连续成功 %d < %d', streak, SUCC_N), applied: false };
+		return { action: 'wait', why: sprintf('连续成功 %d < %d', streak, SUCC_N) };
 	}
 
 	let chain_ok = (opt_of(st, 'chain_exists', 0) == 1);
-	if (!chain_ok) {
-		let fn = (opts != null && type(opts) == 'object' && type(opts.onFn) == 'function')
-			? opts.onFn : null;
-		if (fn == null) return { action: 'full', why: '劫持链不在，需要完整 on', applied: false };
-		fn();
-		return { action: 'full', why: '劫持链不在，已执行完整 on', applied: true };
-	}
-	return { action: 'reload', why: '链在，只重下发上游', applied: false };
+	if (!chain_ok) return { action: 'full', why: '劫持链不在，需要完整 on' };
+	return { action: 'reload', why: '链在，只重下发上游' };
 }

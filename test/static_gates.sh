@@ -95,22 +95,6 @@ else
 	printf '   模式：日常（FAIL 才算问题）\n\n'
 fi
 
-# 层号表：SPEC §3.1。同层互引默认违规；L5 入口不受方向限制。
-layer_of() {
-	case "$1" in
-		# fsutil：文件系统原语，被 L0 的 lock 使用 → 必须在 L0（2026-11-24 加入，
-		# 待 SPEC §3.2 正式登记；未登记时 G3 会按"未登记层号"报红，那是设计意图）
-		sh|lock|log|fsutil) echo 0 ;;
-		# state：从 config 拆出的状态读写，供 config 消费 → L1
-		config|state) echo 1 ;;
-		probe|nft|dnsmasq|conflict|snapshot|timeline) echo 2 ;;
-		status|bundle) echo 3 ;;
-		switch) echo 4 ;;
-		main) echo 5 ;;
-		*) echo "" ;;
-	esac
-}
-
 # 豁免机制（known-large.txt）——fail-closed
 #
 # 规则（team-lead 裁定 U17）：
