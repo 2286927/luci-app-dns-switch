@@ -801,6 +801,47 @@ else
 fi
 
 # ============================================================================
+# A8 rpcd 对象零 import（SPEC §8.6；I4 的落点）
+#
+# 为什么 B 段挡不住：B 段（`ucode -c`）只判"能不能编译"。rpcd 对象 import 了模块
+# **照样编译通过**——于是 B 段全绿、耦合照样发生。这两件事必须分开验。
+#
+# 为什么是三条而不是两条：只查"没有 import / 没有模块名"的话，**一个空文件、
+# 一个只写 `return {}` 的占位文件也满足**。这正是 N37② 那条的形状——"没东西可查"
+# 被当成"没有违规"。所以必须有第 ③ 条的**反向对照**：它得真的在 popen 调 CLI。
+#
+# 一旦 import，CLI 与 ubus 就从"同一份行为的两个入口"退化成"两份可能各自演化的
+# 实现"，症状是行为不一致且极难事后定位（你以为它们是同一个东西）。
+# ============================================================================
+G10="A8 rpcd 零 import"
+if [ ! -f "$RPCD" ]; then
+	S "$G10" "rpcd 对象未交付（P5）；A8 无从校验（--strict 下转 FAIL）"
+else
+	nf10=0
+	imp=$(grep -nE '^[[:space:]]*import' "$RPCD" 2>/dev/null)
+	if [ -n "$imp" ]; then
+		nf10=$((nf10 + 1))
+		D "✗ 出现 import（rpcd 必须与 CLI 进程级耦合，不许 import 模块）："
+		printf '%s\n' "$imp" | sed 's/^/      /'
+	fi
+	modref=$(grep -nE 'dns-switch/[a-z0-9_-]+[.]uc' "$RPCD" 2>/dev/null)
+	if [ -n "$modref" ]; then
+		nf10=$((nf10 + 1))
+		D "✗ 出现模块文件名（哪怕写在注释里——「以后改成 import」这种承诺同样是隐患）："
+		printf '%s\n' "$modref" | sed 's/^/      /'
+	fi
+	if ! grep -qE "popen[(][[:space:]]*['\"]/usr/bin/dns-switch" "$RPCD" 2>/dev/null; then
+		nf10=$((nf10 + 1))
+		D "✗ 没有 popen('/usr/bin/dns-switch … —— 空壳文件不能算通过（N37②：没东西可查 ≠ 没有违规）"
+	fi
+	if [ "$nf10" = 0 ]; then
+		P "$G10" "零 import；且确实 popen 调 CLI（反向对照通过）"
+	else
+		F "$G10" "$nf10 处违规"
+	fi
+fi
+
+# ============================================================================
 # S1 行数配额：≥250 行的模块必须登记在 size-watch.txt（U23）
 # 为什么绑行数而不是绑文件名：规则改成绑行数之后，清单本人立刻又漏了 probe——
 # **清单只要没人比对就会漂**，所以清单本身要有门禁。
@@ -840,7 +881,7 @@ fi
 # grep -c 双零（恒真）、G5/G6 被定义两次（同一门禁跑两遍，结论行 8 PASS 而真实 6 PASS）。
 # 每次都是人肉发现的。这条检查把"每个标签恰好出现一次"变成机器判据。
 # ============================================================================
-LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G8|$G9|$S1"   # A4 已移出到 gates_local.sh
+LABELS="$G0|$G1|$G2|$G3|$G4|$G5|$G6|$G8|$G9|$G10|$S1"   # A4 已移出到 gates_local.sh
 ntag=0; ntagbad=0
 oldifs=$IFS; IFS='|'
 for lbl in $LABELS; do
@@ -857,7 +898,7 @@ for lbl in $LABELS; do
 done
 IFS=$oldifs
 if [ "$ntagbad" = 0 ]; then
-	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（A1–A3/A5/A6/S1；A4 见 gates_local.sh）\n' "$ntag"
+	printf 'PASS  [标签自检] %d 个门禁标签各出现一次（A1–A3/A5/A6/A8/S1；A4 见 gates_local.sh）\n' "$ntag"
 else
 	printf 'FAIL  [标签自检] %d/%d 个标签计数异常 —— 结论行的数字不可信\n' "$ntagbad" "$ntag"
 fi
@@ -883,4 +924,4 @@ if [ "$STRICT" = 1 ] && [ "$NS" != 0 ]; then
 	printf '   --strict：%d 条 SKIP 判为失败。\n' "$NS"
 	exit 1
 fi
-exit 0
+exi

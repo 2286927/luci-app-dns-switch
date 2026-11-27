@@ -85,8 +85,15 @@ import { load } from './config.uc';
 function main(argv) { return load() == 'cfg' ? 0 : 1; }
 exit(main(ARGV));
 XMAIN
-	printf "'use strict';\nreturn { status: {} };\n" \
-		> "$S/root/usr/share/rpcd/ucode/dns-switch"
+	# A8 的好样本：零 import + 真的 popen 调 CLI（空壳会被第 ③ 条判红）
+	cat > "$S/root/usr/share/rpcd/ucode/dns-switch" <<'XRPC'
+'use strict';
+let fs = require('fs');
+let p = fs.popen('/usr/bin/dns-switch status', 'r');
+let out = p ? p.read('all') : null;
+if (p) p.close();
+return { status: { captured: out } };
+XRPC
 	printf '#!/bin/sh\n# G0 样本桩\nexit 0\n' > "$S/root/usr/bin/dns-switch"
 	printf '// ui stub\n' > "$S/htdocs/luci-static/resources/view/g0_probe.js"
 
@@ -184,6 +191,10 @@ inject_g4_orphan() { printf '\nexport function orphan_probe_fn() { return 1; }\n
 inject_a4_export() { printf '\nexport function unlisted_fn() { return 1; }\n' >> "$M/sh.uc"; }
 # A5：state.uc 之外用 cursor(
 inject_a5_cursor() { printf '\nfunction peek() { let c = uci.cursor(); return c; }\n' >> "$M/config.uc"; }
+# A8 两个坏样本：① 加了 import ② 删掉 popen（验第 ③ 条反向对照）
+RP=luci-app-dns-switch/root/usr/share/rpcd/ucode/dns-switch
+inject_a8_import()  { printf "\nimport { run } from './sh.uc';\n" >> "$RP"; }
+inject_a8_nopopen() { sed -i '/popen(/d' "$RP"; }
 inject_g5_emoji()  { printf '\n// \360\237\216\211\n' >> luci-app-dns-switch/htdocs/luci-static/resources/view/g0_probe.js; }
 inject_g6_acl()    { sed 's/"version"//; s/, *]/]/' "$A" > "$A.tmp" && mv "$A.tmp" "$A"; }
 
@@ -202,6 +213,8 @@ inject "layers.txt 缺 config 那行"      "3/6" inject_g3_missing
 inject "孤儿 export(无人引用)"        "4/6" inject_g4_orphan
 inject "前端 js 含 🎉"               "5/6" inject_g5_emoji
 inject "state.uc 之外用 cursor("      "A5" inject_a5_cursor
+inject "rpcd 对象里 import 了模块"    "A8" inject_a8_import
+inject "rpcd 对象删掉 popen(空壳)"    "A8" inject_a8_nopopen
 
 # ---- A4 已经从 static_gates 移出，样本要打 gates_local.sh（否则永远"没有报红"）----
 if [ -f "$HERE/gates_local.sh" ] && [ -n "${SPEC_OVERRIDE:-}" ] && [ -f "$SPEC_OVERRIDE" ]; then
