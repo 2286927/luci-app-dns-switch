@@ -1,4 +1,6 @@
 config.uc
+conflict.uc
+dnsmasq.uc
 fsutil.uc
 lock.uc
 log.uc
