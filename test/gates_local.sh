@@ -29,11 +29,15 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 PKG=$(cd "$HERE/.." && pwd)
 SRC="$PKG/luci-app-dns-switch"
 MODDIR="$SRC/root/usr/libexec/dns-switch"
+# --src 供 G0 自检指向样本树；日常不用
+SRC_OVERRIDE=""
 
 SPEC="${SPEC:-}"
+SRC_OVERRIDE=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--spec) shift; SPEC="${1:-}" ;;
+		--src) shift; SRC_OVERRIDE="${1:-}" ;;
 		-h|--help) sed -n '2,28p' "$0"; exit 0 ;;
 		*) echo "未知参数：$1（可用：--spec PATH）"; exit 2 ;;
 	esac
@@ -47,6 +51,12 @@ esac
 TMPD="$TMPBASE/gates_local.$$"
 trap 'rm -rf "$TMPD"' 0 2 15
 mkdir -p "$TMPD" || { echo "ERROR 建不了临时目录"; exit 2; }
+
+if [ -n "$SRC_OVERRIDE" ]; then
+	PKG=$(cd "$SRC_OVERRIDE" 2>/dev/null && pwd) || { echo "ERROR --src 无效"; exit 2; }
+	SRC="$PKG/luci-app-dns-switch"
+	MODDIR="$SRC/root/usr/libexec/dns-switch"
+fi
 
 printf '== 本地门禁（需要 SPEC.md）==\n'
 printf '   源码树：%s\n' "$SRC"

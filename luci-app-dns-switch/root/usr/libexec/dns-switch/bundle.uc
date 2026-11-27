@@ -80,10 +80,19 @@ export function render(opts) {
 	push(L, "");
 
 	push(L, "== status ==");
-	// status.collect 需要 confdir（测试缝透传）
-	let so = (opts != null && type(opts) == 'object' && type(opts.confdir) == 'string')
-		? { confdir: opts.confdir } : null;
-	push(L, trim(status.render_text(status.collect(so))));
+	// `opts.status` 是**可注入**的：bundle 自身不读现场，但 status.collect 会去跑
+	// `nft list chain` / 读 uci。若两次生成之间 daemon 的 tick 恰好改了劫持链，
+	// 两段文本就会不同 —— 那会让 C6 的"逐字节稳定"变成**偶发红**（flaky）。
+	// 所以：能注入就注入（单测/快照比对），生产不传时才现采一次。
+	let injected = (opts != null && type(opts) == 'object' && type(opts.status) == 'object'
+		&& opts.status != null) ? opts.status : null;
+	let sobj = injected;
+	if (sobj == null) {
+		let so = (opts != null && type(opts) == 'object' && type(opts.confdir) == 'string')
+			? { confdir: opts.confdir } : null;
+		sobj = status.collect(so);
+	}
+	push(L, trim(status.render_text(sobj)));
 	push(L, "");
 
 	push(L, "== 事件时间线 ==");

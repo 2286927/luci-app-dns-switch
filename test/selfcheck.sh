@@ -201,8 +201,26 @@ inject "依赖成环(sh ⇄ config)"          "3/6" inject_g3_cycle
 inject "layers.txt 缺 config 那行"      "3/6" inject_g3_missing
 inject "孤儿 export(无人引用)"        "4/6" inject_g4_orphan
 inject "前端 js 含 🎉"               "5/6" inject_g5_emoji
-inject "代码多一个 SPEC 没登记的导出"  "A4" inject_a4_export
 inject "state.uc 之外用 cursor("      "A5" inject_a5_cursor
+
+# ---- A4 已经从 static_gates 移出，样本要打 gates_local.sh（否则永远"没有报红"）----
+if [ -f "$HERE/gates_local.sh" ] && [ -n "${SPEC_OVERRIDE:-}" ] && [ -f "$SPEC_OVERRIDE" ]; then
+	if sh "$HERE/gates_local.sh" --src "$T/good" --spec "$SPEC_OVERRIDE" > "$T/a4good.log" 2>&1; then
+		ok "好样本 A4：gates_local 不红"
+	else
+		bad "好样本 A4 反而红了（gates_local 有误报）"
+		tail -6 "$T/a4good.log" | sed 's/^/        /'
+	fi
+	rm -rf "$T/bad-a4"; cp -r "$T/good" "$T/bad-a4"
+	( cd "$T/bad-a4" && inject_a4_export )
+	if sh "$HERE/gates_local.sh" --src "$T/bad-a4" --spec "$SPEC_OVERRIDE" > "$T/a4bad.log" 2>&1; then
+		bad "坏样本 代码多一个 SPEC 没登记的导出 → A4 **没有报红**（假绿）"
+	else
+		ok "坏样本 代码多一个 SPEC 没登记的导出 → A4 报红"
+	fi
+else
+	sk "A4（缺 gates_local.sh 或 SPEC 样本）"
+fi
 inject "ACL 缺 version"              "6/6" inject_g6_acl
 
 echo
