@@ -71,22 +71,6 @@ function addtok(tok, mod,   m, seg, head, rest, k) {
 	if (mod !~ /^[a-z0-9][a-z0-9_-]*$/) { print "__UNPARSED__ " a[2]; next }
 
 	cell = a[5]
-	# 「不导出」的行（main.uc / rpcd 对象是程序）不该产出导出名。但不能整格跳过——
-	# config 那行的注释里也写着「不导出」（说的是内部自举的 ensure_config）。
-	# 判据：反引号里出现过 `name(` 才认为这一格在列导出。
-	if (cell ~ /不导出/) {
-		tmp = cell; hascall = 0
-		while (match(tmp, /`[^`]*`/)) {
-			if (substr(tmp, RSTART, RLENGTH) ~ /[(]/) { hascall = 1; break }
-			tmp = substr(tmp, RSTART + RLENGTH)
-		}
-		if (!hascall) next
-	}
-	# 注意：不能整格跳过「不导出」的行——config 那行的注释里也出现了「不导出」三个字，
-	# 整格跳过会把 load/opt/sig 一起吞掉。靠下面的"只认三种形态"过滤就够了：
-	# main 的 `job_start/job_status` 属于斜杠组会漏进来，但 main 是程序且未实现，
-	# A4 只比已实现模块，暂时无害；main.uc 落地时要回头看这条（已记在 README）。
-
 	while (match(cell, /`[^`]*`/)) {
 		tok = substr(cell, RSTART + 1, RLENGTH - 2)
 		addtok(tok, mod)
