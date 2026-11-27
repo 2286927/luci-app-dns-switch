@@ -32,6 +32,8 @@ import * as dnsmasq from './dnsmasq.uc';
 import * as snapshot from './snapshot.uc';
 import { log } from './log.uc';
 import { run as sh_run } from './sh.uc';
+import * as lock from './lock.uc';
+import * as tickrun from './tick.uc';   // 别名避免与导出的 tick() 撞名
 
 const FRAG = '/etc/nftables.d/20-dns-hijack.nft';
 const SETTLE_MS = 1000;
@@ -102,9 +104,6 @@ export function on(opts) {
 	let cfg = config.load(opts);
 	if (cfg == null || cfg.ok != true) {
 		return fail('E_INTERNAL', '配置读不到，未做任何改动');
-	}
-	if (cfg.settings.mode != 'on') {
-		io.set_upstream;                          // 无副作用占位，保持 io 被使用
 	}
 	let adh = cfg.settings.adh_ip;
 	let port = cfg.settings.adh_port;
@@ -184,66 +183,54 @@ export function on(opts) {
 	return { ok: true, snapshot: snap_id, mac: mac };
 }
 
-/** 关闭：回到原生 DNS。顺序：快照 → 清链 → 清 uci → reload → 自检。 */
-export function off(opts) {
-	let io = io_default(opts);
-	let cfg = config.load(opts);
-	if (cfg == null || cfg.ok != true) return fail('E_INTERNAL', '配置读不到，未做任何改动');
+/**
+ * 周期入口：**取锁 → 转调 tick.run → 放锁**。
+ *
+ * 锁是 switch 的职责（v1.0.1 `tick) lock_take || exit 0; do_tick ;;`）。
+ * 三个不许：① 不许做成纯转发（tick.run 自己不加锁 = 没有互斥）；
+ * ② 不许让 main 直接调 tick.run；③ 不许在 tick.run 内部再加锁（会自锁死）。
+ * 为什么必须互斥：两个 tick 并发会同时读写 C9 五个运行态文件，
+ * 典型后果是"两次都读到 fail=1，各写 2，实际该到 3"——降级/回切时机漂移，
+ * 且只在重叠时出现（procd 55s + 手工 tick + apply-intent 三条路径都可能撞）。
+ */
+export function tick(opts) {
+	let lo = (opts != null && type(opts) == 'object' && type(opts.lock_dir) == 'string'
+		&& length(opts.lock_dir)) ? { dir: opts.lock_dir } : null;
 
-	let snap = io.snapshot_save();
-	let snap_id = (snap != null && type(snap.id) == 'string') ? snap.id : '';
-
-	nft.purge('force');
-	let up = io.set_upstream([ ]);
-	if (up == null || up.ok != true) return fail('E_UCI_COMMIT', '清上游失败');
-	let o6 = io.set_option6([ ]);
-	if (o6 == null || o6.ok != true) return fail('E_UCI_COMMIT', '清 option6 失败');
-	let cm = io.commit('dhcp');
-	if (cm == null || cm.ok != true) return fail('E_UCI_COMMIT', 'commit dhcp 失败');
-
-	let rl = io.reload();
-	if (rl != null && rl.rc != null && rl.rc != 0) {
-		rollback(io, snap_id);
-		return fail('E_INTERNAL', 'fw4 reload 失败，已回滚');
-	}
-	io.wait(opt_of(opts, 'wait_ms', SETTLE_MS));
-
-	let v = io.verify(opt_of(cfg, 'probe_domain', 'www.baidu.com'));
-	if (v == null || v.ok != true) {
-		// off 失败不回滚成 on：越故障越要回到原生
-		log('恢复原生后解析异常，检查 WAN 与运营商 DNS');
+	let lk = (lo != null) ? lock.take(lo) : lock.take();
+	if (lk == null || lk.ok != true) {
+		// 与 v1.0.1 的 `lock_take || exit 0` 同义：静默跳过，不是失败
+		return { ok: true, action: 'skipped', why: 'locked' };
 	}
 
-	state.set_setting('mode', 'off');
-	state.set_status('effective', 'off');
-	state.set_status('last_change', "" + time());
-	state.commit();
-	log('已恢复原生 DNS');
-	return { ok: (v != null && v.ok == true), snapshot: snap_id };
-}
-
-/** 按 settings.mode 落一次意图（幂等）。 */
-export function apply_intent(opts) {
-	let cfg = config.load(opts);
-	if (cfg == null || cfg.ok != true) return fail('E_INTERNAL', '配置读不到');
-	return (cfg.settings.mode == 'on') ? on(opts) : off(opts);
-}
-
-/** 开机初始化：只按意图落一次，失败不抛。 */
-export function init(opts) {
-	let r = apply_intent(opts);
-	if (r.ok != true) log(sprintf('开机初始化未成功：%s', r.message));
+	let r = null;
+	try {
+		r = tickrun.run(opts);
+	} catch (e) {
+		r = { ok: false, code: 'E_INTERNAL', message: sprintf('tick 异常：%s', e) };
+	}
+	// 必须放锁：省了就是永久占锁（下次 tick 永远 skipped）
+	if (lo != null) lock.drop(lo); else lock.drop();
 	return r;
 }
 
-/** 演练：验证"能不能降级再回切"。受控路径，跳过冷却。 */
+/** 关闭：**空壳**（P3 后续实现）。返回明确错误码，不是 TODO 注释——
+ *  它会被调用方当成失败，而注释不会。 */
+export function off(opts) {
+	return { ok: false, code: 'E_INTERNAL', message: 'not implemented (P3 后续)' };
+}
+
+/** 按 settings.mode 落意图：**空壳**。 */
+export function apply_intent(opts) {
+	return { ok: false, code: 'E_INTERNAL', message: 'not implemented (P3 后续)' };
+}
+
+/** 开机初始化：**空壳**。 */
+export function init(opts) {
+	return { ok: false, code: 'E_INTERNAL', message: 'not implemented (P3 后续)' };
+}
+
+/** 演练：**空壳**。 */
 export function drill(opts) {
-	let io = io_default(opts);
-	let p1 = io.probe();
-	if (p1 == null || p1.ok != true) p1 = io.probe();
-	if (p1 == null || p1.ok != true) {
-		return fail('E_PRECOND_GATE', '演练前探活失败，无法演练');
-	}
-	let r = off(opts);
-	return (r != null && r.ok == true) ? on(opts) : r;
+	return { ok: false, code: 'E_INTERNAL', message: 'not implemented (P3 后续)' };
 }

@@ -114,22 +114,25 @@ ok("7b 在 reload 之后", index(a.seq, 'reload') < iw);
 ok("7b 在 verify 之前", iw < index(a.seq, 'verify'));
 
 // ---- 2. 失败回滚：verify 失败 → 回到 before ----
-let b = mk_io({ verify: function (d) { push(b.seq, 'verify'); return { ok: false }; } });
+let b = mk_io(null);
+b.io.verify = function (d) { push(b.seq, 'verify'); return { ok: false }; };
 let rb = sw.on({ confdir: CONF, io: b.io, wait_ms: 1000 });
 eq("verify 失败 → ok=false", rb.ok, false);
 eq("且 code=E_APPLY_FAILED", rb.code, "E_APPLY_FAILED");
 eq("**调了 restore 回到快照**", index(b.seq, 'restore:SNAP1') >= 0, true);
-eq("restore 在 verify 之后", index(b.seq, 'restore:SNAP1') > index(b.seq, 'verify'));
+ok("restore 在 verify 之后", index(b.seq, 'restore:SNAP1') > index(b.seq, 'verify'));
 
 // ---- 3. 第 9 步：reload/verify 都过了但链没生效 → 也要回滚 ----
-let c = mk_io({ present: function () { push(c.seq, 'present'); return { hijack: false }; } });
+let c = mk_io(null);
+c.io.present = function () { push(c.seq, 'present'); return { hijack: false }; };
 let rc = sw.on({ confdir: CONF, io: c.io, wait_ms: 1000 });
 eq("链未生效 → ok=false", rc.ok, false);
 eq("且 code=E_NFT_INVALID", rc.code, "E_NFT_INVALID");
 eq("并回滚", index(c.seq, 'restore:SNAP1') >= 0, true);
 
 // ---- 4. 探活失败：**一个字节都不改** ----
-let d = mk_io({ probe: function () { push(d.seq, 'probe'); return { ok: false }; } });
+let d = mk_io(null);
+d.io.probe = function () { push(d.seq, 'probe'); return { ok: false }; };
 let rd = sw.on({ confdir: CONF, io: d.io, wait_ms: 1000 });
 eq("探活失败 → E_PRECOND_GATE", rd.code, "E_PRECOND_GATE");
 eq("探活失败时**没写快照**", index(d.seq, 'snapshot_save'), -1);
@@ -138,10 +141,44 @@ eq("探活失败时**没 commit**", index(d.seq, 'commit'), -1);
 eq("探活给了两次机会", length(filter(d.seq, function (x) { return x == 'probe'; })), 2);
 
 // ---- 5. 53 冲突 block：退出且不改动 ----
-let e = mk_io({ scan: function () { push(e.seq, 'scan'); return { level: 'block', by: 'AdGuardHome' }; } });
+let e = mk_io(null);
+e.io.scan = function () { push(e.seq, 'scan'); return { level: 'block', by: 'AdGuardHome' }; };
 let re = sw.on({ confdir: CONF, io: e.io, wait_ms: 1000 });
 eq("冲突 block → E_PRECOND_GATE", re.code, "E_PRECOND_GATE");
 eq("冲突时没落盘", index(e.seq, 'write'), -1);
+
+// ---- 5b. 四个空壳：必须**明确失败**，不能静默 ok ----
+// 这条不是应付门禁：空壳最容易被人"顺手改成 return {ok:true}"，
+// 那样调用方会以为 off/drill 生效了。断言的是"它会失败"这个行为。
+eq("off 是空壳，明确失败", sw.off({}).code, "E_INTERNAL");
+eq("apply_intent 是空壳", sw.apply_intent({}).code, "E_INTERNAL");
+eq("init 是空壳", sw.init({}).code, "E_INTERNAL");
+eq("drill 是空壳", sw.drill({}).code, "E_INTERNAL");
+ok("空壳的 message 说明未实现", match(sw.off({}).message, /not implemented/) != null);
+
+// ---- 5c. switch.tick()：取锁 → 转调 → 放锁（互斥证明）----
+let LOCK = BASE + '/lock.d';
+let TST = BASE + '/tickstate';
+mkdir_p(TST);
+
+// (a) 正常：拿到锁、跑完、把锁放掉
+let rk1 = sw.tick({ confdir: CONF, state_dir: TST, chain_exists: true, now: 5000, lock_dir: LOCK });
+eq("tick 返回结果对象（与其它导出同形）", rk1.ok, true);
+eq("正常跑完的 action 来自 tick.run", type(rk1.action), "string");
+eq("跑完**不放着锁**（lock.drop 生效）", fs.stat(LOCK), null);
+
+// (b) 别人持锁时：静默退出，**不执行**（证明互斥真的存在）
+mkdir_p(LOCK);
+fs.writefile(LOCK + '/pid', "1\n");            // pid 1 = 一定活着
+fs.writefile(LOCK + '/since', sprintf('%d\n', time()));
+fs.unlink(TST + '/dns-switch.last_check');
+let rk2 = sw.tick({ confdir: CONF, state_dir: TST, chain_exists: true, now: 6000, lock_dir: LOCK });
+eq("有人持锁 → ok=true（不是失败）", rk2.ok, true);
+eq("有人持锁 → action=skipped", rk2.action, "skipped");
+eq("并说明原因", rk2.why, "locked");
+eq("有人持锁时**没有执行**（last_check 未写）", fs.stat(TST + '/dns-switch.last_check'), null);
+ok("别人的锁还在（没被抢）", fs.stat(LOCK) != null);
+fs.unlink(LOCK + '/pid'); fs.unlink(LOCK + '/since'); fs.rmdir(LOCK);
 
 // ---- 6. 收尾 ----
 wipe(BASE); fs.rmdir(BASE);

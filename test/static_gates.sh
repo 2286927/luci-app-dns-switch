@@ -529,6 +529,13 @@ else
 			strip_comments "$uf" > "$TMPD/g4/$(basename "$uf")" 2>/dev/null
 		done
 		find "$SRC" -type f ! -name '*.uc' > "$TMPD/g4/others.list" 2>/dev/null || :
+		# 测试侧：.uc 剥注释，其它（.sh/.awk/.md）原样
+		mkdir -p "$TMPD/g4t"
+		for tf in "$PKG"/test/unit/*_test.uc "$PKG"/test/*_test.uc; do
+			[ -f "$tf" ] || continue
+			strip_comments "$tf" > "$TMPD/g4t/$(basename "$tf")" 2>/dev/null
+		done
+		find "$PKG/test" -type f ! -name '*_test.uc' > "$TMPD/g4t/others.list" 2>/dev/null || :
 		# 守卫数据：如果所有剥注释后的文件都是空的，说明剥离本身坏了（函数未定义/正则错），
 		# 此时每个 export 都会被判成"仅测试引用"——那是门禁失效，不是代码有问题。
 		g4bytes=$(cat "$TMPD/g4"/*.uc 2>/dev/null | wc -c | tr -d ' ')
@@ -544,7 +551,16 @@ else
 					if grep -qw -- "$name" "$of" 2>/dev/null; then prod=$of; break; fi
 				done < "$TMPD/g4/others.list"
 			fi
-			tst=$(grep -rlw -- "$name" "$PKG/test" 2>/dev/null | grep -v -F -x -- "$def" | head -1)
+			# 测试侧也要剥注释：否则「在测试文件的注释里提一句某函数」就能凑出一个消费者，
+			# 而这恰恰是 U37（补单测让 apply_intent 转 WARN）最容易被糊弄的点——
+			# 门槛必须是"真实调用"，不是"提到过"。实测当前受影响的条目为 0。
+			tst=$(grep -rlw -- "$name" "$TMPD/g4t" 2>/dev/null | head -1)
+			if [ -z "$tst" ]; then
+				while IFS= read -r tf; do
+					[ -f "$tf" ] || continue
+					if grep -qw -- "$name" "$tf" 2>/dev/null; then tst=$tf; break; fi
+				done < "$TMPD/g4t/others.list"
+			fi
 			if [ -n "$prod" ]; then
 				:
 			elif [ -n "$tst" ]; then
