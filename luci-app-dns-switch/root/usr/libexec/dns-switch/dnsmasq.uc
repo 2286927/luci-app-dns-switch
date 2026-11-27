@@ -13,7 +13,8 @@
 // dns_switch）会返回 ok 而 dhcp 一个字节没落盘 —— "看着成功、实际没变"。
 //
 // 写 uci 一律经 `state.set_opt()` + `state.commit('dhcp')`：
-// A5 门禁 grep `cursor(` 只许出现在 state.uc，本模块不许自己开 cursor。
+// A5 门禁会扫"uci 句柄"与"经 shell 调 uci"两种形式：本模块两样都不许有。
+// （这里刻意不写那两个 API 的名字——注释里出现关键字会让门禁假红，见 U24。）
 //
 // 实测（写这一版时踩到的）：
 //   * `state.set_opt(..., 数组)` 才是 uci **list**；传字符串是标量覆盖，
