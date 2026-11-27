@@ -11,4 +11,5 @@ sh.uc
 snapshot.uc
 state.uc
 status.uc
+switch-tier.uc
 timeline.uc
