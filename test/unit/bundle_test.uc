@@ -38,9 +38,28 @@ function ok(name, cond) {
 	else { fail++; print("FAIL  " + name + "\n"); }
 }
 
+// 长文本比较失败时，光打整串是**看不出差异**的（这次的 flaky 就栽在这：
+// 差异在 40 多行文本的中段一行，人眼扫不出来）。所以字符串不同就定位到行。
+function first_diff_line(a, b) {
+	let la = split(a, '\n');
+	let lb = split(b, '\n');
+	let n = (length(la) < length(lb)) ? length(la) : length(lb);
+	for (let i = 0; i < n; i++) {
+		if (la[i] !== lb[i]) return sprintf('第 %d 行不同（0-based %d）', i + 1, i);
+	}
+	return sprintf('前 %d 行相同，差异在长度：%d vs %d', n, length(la), length(lb));
+}
+
 function eq(name, got, want) {
-	if (got === want) { pass++; print("PASS  " + name + "\n"); }
-	else { fail++; printf("FAIL  %s\n      got =%s\n      want=%s\n", name, show(got), show(want)); }
+	if (got === want) { pass++; print("PASS  " + name + "\n"); return; }
+	fail++;
+	let ta = type(got);
+	let tb = type(want);
+	if (ta == 'string' && tb == 'string' && (length(got) > 120 || length(want) > 120)) {
+		printf("FAIL  %s\n      两者都是 string 但不相等；%s\n", name, first_diff_line(got, want));
+		return;
+	}
+	printf("FAIL  %s\n      got =%s\n      want=%s\n", name, show(got), show(want));
 }
 
 function mkdir_p(path) {
