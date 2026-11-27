@@ -29,6 +29,7 @@ function opt_of(opts, key, dflt) {
 		if (type(v) == 'string' && length(v)) return v;
 		if (type(v) == 'int') return v;
 		if (type(v) == 'bool') return v;
+		if (type(v) == 'array') return v;      // 上游列表是数组：漏这条会被降级成 null
 	}
 	return dflt;
 }
@@ -63,8 +64,9 @@ function write_int(opts, name, v) {
 	return fs.writefile(path_of(opts, name), sprintf('%d\n', v)) != null;
 }
 
-/** 读运行态 → 组装 tier 需要的 state。只搬运，不判定。 */
-export function read_state(opts) {
+// 读运行态 → 组装 tier 需要的 state。只搬运、不判定。**内部函数**：
+// 没有生产消费者，导出会让 A4（契约）与 G4（孤儿）同时报。
+function read_state(opts) {
 	let eff = state.get_opt('dns_switch', 'status', 'effective');
 	let chain = opt_of(opts, 'chain_exists', null);
 	if (chain == null) chain = nft.present().hijack;

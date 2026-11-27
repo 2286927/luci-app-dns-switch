@@ -99,7 +99,10 @@ else {
 fs.writefile(SDIR + '/dns-switch.fail', "2\n");
 let d1 = tick.tick_once(O);
 
-let st_now = tick.read_state(O);
+// **手写 state 字面量**，不调 tick.read_state：
+// 否则"比较两边"都经过同一个函数，是循环论证（它错两次也一致）。
+let st_now = { now: 1000, cool_at: 0, effective: 'on',
+	fail_streak: 2, ok_streak: 0, chain_exists: 1 };
 let direct = tier.tier_failover(st_now, { ok: true, settings: { mode: 'on', adh_ip: '172.16.1.2' }, status: {} });
 eq("失败 2 次时 tier 直接判定", direct.action, "failover");
 eq("tick_once 的 action 与 tier 一致（证明是转发不是重写）", d1.action, direct.action);
@@ -161,6 +164,10 @@ eq("回切成功后写冷却", trim(fs.readfile(SDIR + '/dns-switch.cooldown')),
 eq("succ 计数被清零", trim(fs.readfile(SDIR + '/dns-switch.succ')), "0");
 
 // ---- 6b. 降级缺上游列表 → E_INTERNAL，不静默 ----
+// 先把 effective 拨回 on：上一段把它改成 failover 了，
+// 而 tier_failover 要求 eff=='on' 才允许降级（v1.0.1:1662）。
+state.set_status('effective', 'on');
+state.commit();
 fs.writefile(SDIR + '/dns-switch.fail', "2\n");
 let r3 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 4000, act: act });
 eq("降级缺上游列表 → ok=false", r3.ok, false);

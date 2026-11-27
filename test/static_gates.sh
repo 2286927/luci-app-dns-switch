@@ -499,9 +499,27 @@ else
 		S "$G4" "没有任何 export"
 	else
 		: > "$TMPD/g4.orph"; : > "$TMPD/g4.warn"
+		# **生产侧引用必须先剥注释再数**：在注释里提一句某函数会被算成"有消费者"→ 假绿。
+		# 这和 A5（cursor(）/A6（fs）是同一个 N37④ 形状。实测影响面：71 个 export 里只有
+		# 3 个靠注释假绿（conflict.scan / log.warn / snapshot.diff），且三者都有测试引用，
+		# 所以修完只是 PASS→WARN，不会凭空多出红。
+		# 测试侧不剥：测试是人工写的断言，注释里提到函数名不构成"假消费者"风险更低。
+		mkdir -p "$TMPD/g4"
+		for uf in "$MODDIR"/*.uc; do
+			[ -f "$uf" ] || continue
+			strip_comments "$uf" > "$TMPD/g4/$(basename "$uf")" 2>/dev/null
+		done
+		find "$SRC" -type f ! -name '*.uc' > "$TMPD/g4/others.list" 2>/dev/null || :
 		while IFS='|' read -r def name; do
 			[ -n "$name" ] || continue
-			prod=$(grep -rlw -- "$name" "$SRC" 2>/dev/null | grep -v -F -x -- "$def" | head -1)
+			prod=$(grep -rlw -- "$name" "$TMPD/g4" 2>/dev/null | head -1)
+			if [ -z "$prod" ]; then
+				while IFS= read -r of; do
+					[ -f "$of" ] || continue
+					if grep -qw -- "$name" "$of" 2>/dev/null; then prod=$of; break; fi
+				done < "$TMPD/g4/others.list"
+			fi
+			[ -n "$prod" ] || prod=""
 			tst=$(grep -rlw -- "$name" "$PKG/test" 2>/dev/null | grep -v -F -x -- "$def" | head -1)
 			if [ -n "$prod" ]; then
 				:
