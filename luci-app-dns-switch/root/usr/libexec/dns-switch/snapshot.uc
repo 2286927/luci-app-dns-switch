@@ -136,15 +136,23 @@ function fail(code, message) {
 
 // ---------- 导出 ----------
 
-/** 只留最近 KEEP 份。返回 { ok, removed }。 */
-export function prune(opts) {
+/**
+ * 只留最近 KEEP 份。`keep` = 绝不许删的路径（save 传自己刚建的那份）。
+ * 若不保护：时钟回拨/改名会让新快照在排序上变"最旧"，prune 把自己删掉
+ * （"备份把备份删了"）。v1.0.1 同行为，这里只加保护、不改保留策略。
+ */
+export function prune(opts, keep) {
 	let dir = dir_of(opts);
 	let names = sorted_names(dir);
 	let removed = 0;
+	let guard = (type(keep) == 'string') ? keep : '';
 	while (length(names) > KEEP) {
-		rm_rf(dir + '/' + names[0]);
+		let victim = dir + '/' + names[0];
+		if (length(guard) && victim == guard) break;   // 绝不删刚建的那份
+		rm_rf(victim);
 		names = sorted_names(dir);
 		removed++;
+		if (length(names) <= KEEP) break;
 	}
 	return { ok: true, removed: removed };
 }
@@ -169,7 +177,7 @@ export function save(opts) {
 	fs.writefile(d + '/dns_switch.uci', uci_text_of(cfg));
 	fs.writefile(d + '/mode', cfg.settings.mode + '\n');
 
-	prune(opts);
+	prune(opts, d);        // 传自己，避免 prune 把刚存的那份当最旧删掉
 	log(sprintf('已备份到 %s', dir));
 	return { ok: true, id: ts };
 }
@@ -259,9 +267,7 @@ export function restore(id, opts) {
 }
 
 /**
- * 比对两份快照，返回**文本**（C4 要逐字节比，所以这里直接出文本）。
- * 时间戳归一化由调用方/门禁负责。
- */
+ * 比对两份快照，返回文本（C4 逐字节比；时间戳归一化由门禁负责）。 */
 export function diff(a, b, opts) {
 	let dir = dir_of(opts);
 	let da = dir + '/' + a;

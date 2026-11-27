@@ -141,6 +141,11 @@ if [ "$MODE" = regen ]; then
 		fi
 	done || rc=$?
 	[ "$rc" = 0 ] || exit 1
+	# 第 5 组：非默认 ADH（三参 build 的对照基准）
+	DOT853=allow ADH=10.0.0.1 MAC= NFT_OUT="$GOLDEN/nft-allow-nomac-adh10.nft" sh "$GEN_SH" \
+		|| { say "ERROR 生成失败（adh 变体）"; exit 1; }
+	printf 'WROTE %-28s %5s bytes\n' "nft-allow-nomac-adh10.nft" \
+		"$(wc -c < "$GOLDEN/nft-allow-nomac-adh10.nft" | tr -d ' ')"
 	say "== REGEN 完成；请 sh test/nft_golden.sh 复核 =="
 	exit 0
 fi
@@ -238,6 +243,43 @@ for d in allow block; do
 		npass=$((npass + 1))
 	done
 done
+
+
+# ---- 第 5 组：非默认 ADH（三参 build）--------------------------------------
+# 4 组 fixture 全用默认 172.16.1.2。build(dot,mac,adh?) 加了第三参却不测它，
+# 等于"参数接错了也没人知道"。所以**单独一段、单独调三参**，不塞进上面的循环——
+# 塞进去会让人误以为四组都传了 adh。
+FX5="$GOLDEN/nft-allow-nomac-adh10.nft"
+ADH5="10.0.0.1"
+G5F="$OUT_DIR/g5.nft"
+U5F="$OUT_DIR/u5.nft"
+
+if [ ! -f "$FX5" ]; then
+		bad "adh=10.0.0.1  fixture 缺失：$FX5"
+		nfail=$((nfail + 1))
+	else
+		DOT853=allow ADH="$ADH5" MAC= NFT_OUT="$G5F" sh "$GEN_SH"
+		if ! cmp -s "$G5F" "$FX5"; then
+			bad "adh=10.0.0.1  shell 版输出 ≠ fixture"
+			show_diff "$G5F" "$FX5" | sed 's/^/      /'
+			nfail=$((nfail + 1))
+		elif [ "$HAVE_UC" = 0 ]; then
+			ok "adh=10.0.0.1  shell == fixture（ucode 侧待实现）"
+			npass=$((npass + 1))
+		elif ! "$UCODE_BIN" -e "$UC_LOAD; fs.writefile('$U5F', nft.build('allow','','$ADH5'))" \
+				>/dev/null 2>"$OUT_DIR/u.err"; then
+			bad "adh=10.0.0.1  ucode 三参调用失败"
+			head -20 "$OUT_DIR/u.err" | sed 's/^/      /'
+			nfail=$((nfail + 1))
+		elif ! cmp -s "$G5F" "$U5F"; then
+			bad "adh=10.0.0.1  ucode 输出 ≠ v1.0.1（第三参没生效？）"
+			show_diff "$G5F" "$U5F" | sed 's/^/      /'
+			nfail=$((nfail + 1))
+		else
+			ok "adh=10.0.0.1  三参调用逐字节一致（$(wc -c < "$G5F" | tr -d ' ')B）"
+			npass=$((npass + 1))
+		fi
+fi
 
 say ""
 if [ "$nfail" -ne 0 ]; then

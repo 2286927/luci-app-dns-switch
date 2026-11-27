@@ -245,6 +245,11 @@ export function set_opt(conf, sect, key, val) {
 	return true;
 }
 
+/** 写 settings 段的一个字段（不 commit）。`set_opt` 的糖，对称于 set_status。 */
+export function set_setting(key, val) {
+	return set_opt(PKG, SECT, key, val);
+}
+
 /** 写 status 段的一个字段（不 commit）。`set_opt` 的糖，语义等价。 */
 export function set_status(key, val) {
 	return set_opt(PKG, STAT, key, val);
