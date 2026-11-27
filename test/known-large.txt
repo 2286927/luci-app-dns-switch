@@ -1,2 +1,2 @@
-root/usr/bin/dns-switch P4
+root/usr/bin/dns-switch P5
 root/usr/share/rpcd/acl.d/luci-app-dns-switch.json P4
