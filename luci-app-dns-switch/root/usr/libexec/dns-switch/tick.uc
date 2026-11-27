@@ -81,10 +81,8 @@ export function read_state(opts) {
  * 配置读不到时回 {ok:false}，不猜。
  */
 export function tick_once(opts) {
-	// **先 load 再读运行态**：`read_state` 要经 state.get_opt 读 effective，
-	// 而 cursor 是 config.load/state.open 建的。顺序反了会读到上一次调用留下的
-	// cursor（可能已 null 或指向别的 confdir），effective 变成空 →
-	// tier_failover 判 "不是 on" → 整轮静默 action=none（假绿）。
+	// **先 load 再读运行态**：cursor 由 config.load 建；顺序反了会读到上一次的
+	// cursor（可能已 null），effective 变空 → tier 判"不是 on" → 静默 action=none。
 	let cfg = config.load(opts);
 	if (cfg == null || cfg.ok != true) {
 		return {

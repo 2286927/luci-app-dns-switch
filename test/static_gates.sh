@@ -924,4 +924,4 @@ if [ "$STRICT" = 1 ] && [ "$NS" != 0 ]; then
 	printf '   --strict：%d 条 SKIP 判为失败。\n' "$NS"
 	exit 1
 fi
-exi
+exit 0
