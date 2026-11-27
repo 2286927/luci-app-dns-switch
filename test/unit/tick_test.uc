@@ -114,17 +114,57 @@ eq("失败 1 次 → none", tick.tick_once(O).action, "none");
 eq("配置读不到 → ok=false",
 	tick.tick_once({ confdir: BASE + '/nope/deeper', state_dir: SDIR, chain_exists: true }).ok, false);
 
-// ---- 5. run 主路径：apply=false 时只决策不执行，且写 last_check ----
+// ---- 5. run 的**真执行分支**（注入替身，不是开关）----
+// 这一段是 N39 的落点：断言"真切成功后写冷却 + 清计数"，而不是"不执行时不写"。
+let calls = [];
+let act = {
+	failover: function (list) { push(calls, { kind: 'failover', list: list }); return { ok: true }; },
+	recover:  function (list) { push(calls, { kind: 'recover', list: list }); return { ok: true }; }
+};
+
 fs.writefile(SDIR + '/dns-switch.fail', "2\n");
-let r1 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 2000, apply: false });
-eq("run 返回 failover 决策", r1.action, "failover");
-eq("apply=false 时不写冷却（没有真切换）", fs.stat(SDIR + '/dns-switch.cooldown'), null);
+let r1 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 2000,
+	isp_list: [ '1.1.1.1', '8.8.8.8' ], act: act });
+eq("run 返回 failover", r1.action, "failover");
+eq("act.failover 被调 1 次", length(calls), 1);
+eq("传给 failover 的是运营商列表", join(',', calls[0].list), "1.1.1.1,8.8.8.8");
+ok("**真切成功后**冷却文件存在", fs.stat(SDIR + '/dns-switch.cooldown') != null);
+eq("冷却值 = 本次 now", trim(fs.readfile(SDIR + '/dns-switch.cooldown')), "2000");
+eq("fail 计数被清零", trim(fs.readfile(SDIR + '/dns-switch.fail')), "0");
 eq("run 写了 last_check", trim(fs.readfile(SDIR + '/dns-switch.last_check')), "2000");
 
-// ---- 6. run：需要上游列表但没给 → E_INTERNAL，不静默 ----
-let r2 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 3000, apply: true });
-eq("降级缺上游列表 → ok=false", r2.ok, false);
-eq("且给 E_INTERNAL", r2.code, "E_INTERNAL");
+// ---- 5b. 下发失败时**不许**写冷却（位置对不对的关键反证）----
+let bad_act = {
+	failover: function (l) { return { ok: false, code: 'E_UCI_COMMIT' }; },
+	recover:  function (l) { return { ok: true }; }
+};
+fs.unlink(SDIR + '/dns-switch.cooldown');
+fs.writefile(SDIR + '/dns-switch.fail', "2\n");
+let r1b = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 2500,
+	isp_list: [ '1.1.1.1' ], act: bad_act });
+eq("下发失败 → run ok=false", r1b.ok, false);
+eq("下发失败时**不写**冷却", fs.stat(SDIR + '/dns-switch.cooldown'), null);
+eq("下发失败时 fail 计数不动", trim(fs.readfile(SDIR + '/dns-switch.fail')), "2");
+
+// ---- 6. 回切路径：act.recover 被调、写冷却、清 succ ----
+state.set_status('effective', 'failover');
+state.commit();
+fs.writefile(SDIR + '/dns-switch.succ', "3\n");
+calls = [];
+fs.unlink(SDIR + '/dns-switch.cooldown');
+let r2 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 3000,
+	adh_upstream: [ '172.16.1.2' ], act: act });
+eq("回切 → action=reload", r2.action, "reload");
+eq("act.recover 被调 1 次", length(calls), 1);
+eq("调的是 recover 不是 failover", calls[0].kind, "recover");
+eq("回切成功后写冷却", trim(fs.readfile(SDIR + '/dns-switch.cooldown')), "3000");
+eq("succ 计数被清零", trim(fs.readfile(SDIR + '/dns-switch.succ')), "0");
+
+// ---- 6b. 降级缺上游列表 → E_INTERNAL，不静默 ----
+fs.writefile(SDIR + '/dns-switch.fail', "2\n");
+let r3 = tick.run({ confdir: CONF, state_dir: SDIR, chain_exists: true, now: 4000, act: act });
+eq("降级缺上游列表 → ok=false", r3.ok, false);
+eq("且给 E_INTERNAL", r3.code, "E_INTERNAL");
 
 // ---- 7. 收尾 ----
 wipe(BASE); fs.rmdir(BASE);

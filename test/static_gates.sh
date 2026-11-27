@@ -776,9 +776,17 @@ else
 		[ -f "$f" ] || continue
 		ntot9=$((ntot9 + 1))
 		decl=$(printf '%s' "${deps:-}" | tr ',' ' ')
+		# **必须先剥注释**：switch-tier.uc 的头注释里写着「谁想加 require('fs') 都会当场红」，
+		# 不剥注释就会拿这句**警告**当违规证据——这正是 A5 修过的同一个毛病，A6 当时漏了。
+		strip_comments "$f" > "$TMPD/a6.code" 2>/dev/null
+		if [ -s "$f" ] && [ ! -s "$TMPD/a6.code" ]; then
+			nf9=$((nf9 + 1))
+			D "✗ $m 剥注释后为空 —— 门禁自身失效（N37②），不许当作通过"
+			continue
+		fi
 		for b in $BUILTINS; do
-			if grep -qE "(^|[^A-Za-z0-9_])$b[.]" "$f" 2>/dev/null \
-				|| grep -q "require('$b')" "$f" 2>/dev/null; then
+			if grep -qE "(^|[^A-Za-z0-9_])$b[.]" "$TMPD/a6.code" 2>/dev/null \
+				|| grep -q "require('$b')" "$TMPD/a6.code" 2>/dev/null; then
 				case " $decl " in
 					*" $b "*) : ;;
 					*) nf9=$((nf9 + 1))
