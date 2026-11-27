@@ -48,7 +48,7 @@ MAC_ON="aa:bb:cc:dd:ee:ff"
 UCODE_BIN="${UCODE:-ucode}"
 
 # ucode 侧的导入语句：nft.uc 落地后若 import 形式不同，**只改这一行**，比较逻辑不动
-UC_LOAD="import * as nft from '$NFT_UC'"
+UC_LOAD="let fs = require('fs'); import * as nft from '$NFT_UC'"
 
 MODE=verify
 FORCED=0
