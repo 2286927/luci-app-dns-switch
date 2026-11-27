@@ -2,7 +2,7 @@ config.uc L1 state
 fsutil.uc L0 fs
 lock.uc L0 fs,fsutil
 log.uc L0 sh,fs
-nft.uc L2 sh,log
-probe.uc L2 config,sh,log
+nft.uc L2 sh,log,fs
+probe.uc L2 config,sh,log,fs
 sh.uc L0 fs
-state.uc L1 uci,log
+state.uc L1 uci,log,fs
