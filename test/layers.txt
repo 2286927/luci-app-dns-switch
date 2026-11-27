@@ -7,4 +7,5 @@ log.uc L0 sh,fs
 nft.uc L2 sh,log,fs
 probe.uc L2 config,sh,log,fs
 sh.uc L0 fs
+snapshot.uc L2 config,nft,log,state,sh,fs
 state.uc L1 uci,log,fs

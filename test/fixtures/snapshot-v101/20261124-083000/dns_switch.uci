@@ -1,0 +1,13 @@
+dns_switch.settings=dns_switch
+dns_switch.settings.mode='on'
+dns_switch.settings.adh_ip='172.16.1.2'
+dns_switch.settings.adh_port='3030'
+dns_switch.settings.fallback_dns='172.16.5.5'
+dns_switch.settings.fallback_dns6=''
+dns_switch.settings.probe_domain='www.baidu.com'
+dns_switch.settings.dot853='allow'
+dns_switch.settings.upstream_mode='auto'
+dns_switch.settings.adh_mac='aa:bb:cc:dd:ee:ff'
+dns_switch.status=status
+dns_switch.status.effective='on'
+dns_switch.status.last_change='1795481000'

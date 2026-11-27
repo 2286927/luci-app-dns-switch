@@ -1,3 +1,4 @@
 conflict.uc cache.uc
 probe.uc messages.uc
+snapshot.uc snapshot-io.uc
 state.uc defaults.uc

@@ -1,0 +1,16 @@
+
+config dnsmasq
+	option port '53'
+	option noresolv '1'
+	option strictorder '1'
+	option dns_redirect '0'
+	list server '172.16.1.2'
+	list server '202.103.224.68'
+	list server '202.103.225.68'
+
+config dhcp 'lan'
+	option interface 'lan'
+	option ra 'server'
+	list dhcp_option '3,172.16.1.1'
+	list dhcp_option '6,172.16.1.2,172.16.5.5'
+	list dns '2400:9:2000:100::1'
